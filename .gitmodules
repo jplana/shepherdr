@@ -1,0 +1,3 @@
+[submodule "shaping-skills"]
+	path = shaping-skills
+	url = https://github.com/rjs/shaping-skills.git

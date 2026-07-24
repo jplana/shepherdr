@@ -106,15 +106,18 @@ session id is captured and `session_id` stays null.
 
 ## super-shepherdr (superpowers + shepherdr)
 
-Paired with [superpowers](https://github.com/obra/superpowers), shepherdr turns every delegated subagent in a superpowers workflow into a live, auditable pane you can watch, resume, and take over — a combination worth its own name: **super-shepherdr**.
+Paired with [superpowers](https://github.com/obra/superpowers) and the [shaping-skills](https://github.com/rjs/shaping-skills) methodology, shepherdr turns every delegated subagent in the workflow into a live, auditable pane you can watch, resume, and take over — a combination worth its own name: **super-shepherdr**.
 
-Three overlay skills — bundled in [`superpowers/`](superpowers/) with a full activation guide — call this binary. Each follows its stock superpowers skill exactly and is active only when `HERDR_ENV=1`; otherwise stock superpowers runs unchanged:
+The `HERDR_ENV=1` pipeline runs in four steps. Steps 1–2 are stock skills; steps 3–4 are herdr overlays (bundled in [`superpowers/`](superpowers/)) that call this binary. Each overlay follows its stock superpowers skill exactly and is active only when `HERDR_ENV=1`; otherwise stock superpowers runs unchanged:
 
-- `brainstorming-herdr` — before the approval gate, **asks** whether the design merits a codex second opinion; dispatches only on yes; reuses a prior second-opinion pane via `--reuse-pane`.
-- `writing-plans-herdr` — same, for the finished plan before execution handoff.
-- `subagent-driven-development-herdr` — runs each **implementer** as a visible pane; adds **no** codex review (review follows stock SDD).
+1. **Spec** → `shaping` (stock, from the [`shaping-skills`](shaping-skills/) submodule). Initial spec planning. No codex second opinion.
+2. **Breadboard** → `breadboarding` (stock, same submodule). Detail the shaped parts into affordances. No codex second opinion.
+3. **Plan** → `writing-plans-herdr` — **asks** whether the finished plan merits a codex second opinion before the execution handoff; dispatches only on yes; reuses a prior second-opinion pane via `--reuse-pane`.
+4. **Execute** → `subagent-driven-development-herdr` — runs each **implementer** as a visible pane; adds **no** codex review (review follows stock SDD).
 
-See [`superpowers/README.md`](superpowers/README.md) to activate super-shepherdr.
+The `brainstorming-herdr` overlay still ships in `superpowers/` (same codex-ask pattern, for the brainstorm gate) but is **not** part of the default pipeline — `shaping` replaces it as the entry point.
+
+The shaping/breadboarding skills come from the vendored [`shaping-skills`](shaping-skills/) git submodule, so clone with `--recurse-submodules` (or run `git submodule update --init`). See [`superpowers/README.md`](superpowers/README.md) to activate super-shepherdr.
 
 ## Development
 
