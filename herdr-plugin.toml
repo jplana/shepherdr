@@ -1,4 +1,4 @@
-id = "afogel.shepherdr"
+id = "jplana.shepherdr"
 name = "shepherdr"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
@@ -35,11 +35,11 @@ command = ["shepherdr", "board"]
 [[keys.command]]
 key = "prefix+r"
 type = "plugin_action"
-command = "afogel.shepherdr.second-opinion"
+command = "jplana.shepherdr.second-opinion"
 description = "codex second opinion on the focused diff"
 
 [[keys.command]]
 key = "prefix+shift+r"
 type = "plugin_action"
-command = "afogel.shepherdr.resume-last"
+command = "jplana.shepherdr.resume-last"
 description = "resume the newest resumable dispatch in a headed pane"
