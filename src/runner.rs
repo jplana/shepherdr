@@ -80,7 +80,8 @@ pub trait HerdrRunner {
     fn wait_output(&self, pane: &str, matcher: &str, timeout_ms: u64) -> Result<bool>;
     fn read(&self, pane: &str, source: &str, lines: u32) -> Result<String>;
     fn close(&self, pane: &str) -> Result<()>;
-    fn tab_create(&self, workspace: &str, label: &str) -> Result<String>;
+    /// Opens a background tab in `from_pane`'s workspace and returns its root pane.
+    fn open_tab(&self, from_pane: &str, label: &str, cwd: Option<&str>) -> Result<String>;
     fn pane_exists(&self, pane: &str) -> Result<bool>;
 }
 
@@ -128,25 +129,40 @@ impl<E: CommandExec> HerdrRunner for CliRunner<E> {
         self.call(&[s("pane"), s("close"), s(pane)], false)?;
         Ok(())
     }
-    fn tab_create(&self, workspace: &str, label: &str) -> Result<String> {
-        let args = vec![s("tab"), s("create"), s("--workspace"), s(workspace),
-                        s("--label"), s(label)];
-        Ok(self.call(&args, true)?.stdout)
+    fn open_tab(&self, from_pane: &str, label: &str, cwd: Option<&str>) -> Result<String> {
+        let workspace = pane_list(&self.call(&[s("pane"), s("list")], true)?)?
+            .iter()
+            .find(|p| p.get("pane_id").and_then(Value::as_str) == Some(from_pane))
+            .and_then(|p| p.get("workspace_id")?.as_str().map(String::from))
+            .ok_or_else(|| anyhow!("no workspace found for pane {from_pane}"))?;
+        let mut args = vec![s("tab"), s("create"), s("--workspace"), workspace];
+        if let Some(dir) = cwd { args.push(s("--cwd")); args.push(s(dir)); }
+        args.extend([s("--label"), s(label), s("--no-focus")]);
+        let out = self.call(&args, true)?;
+        let parsed: Value = serde_json::from_str(&out.stdout)?;
+        parsed
+            .pointer("/result/root_pane/pane_id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| anyhow!("herdr tab create gave no root pane: {}", out.stdout))
     }
     fn pane_exists(&self, pane: &str) -> Result<bool> {
         // Ok(false) must mean herdr said the pane is gone, so anything else is an error.
-        let out = self.call(&[s("pane"), s("list")], true)?;
-        if out.code != 0 {
-            bail!("herdr pane list exited with code {}", out.code);
-        }
-        let parsed: Value = serde_json::from_str(&out.stdout)?;
-        let panes = parsed
-            .get("result")
-            .and_then(|r| r.get("panes"))
-            .and_then(|p| p.as_array())
-            .ok_or_else(|| anyhow!("herdr pane list gave no panes: {}", out.stdout))?;
+        let panes = pane_list(&self.call(&[s("pane"), s("list")], true)?)?;
         Ok(panes.iter().any(|p| p.get("pane_id").and_then(|id| id.as_str()) == Some(pane)))
     }
+}
+
+fn pane_list(out: &ExecResult) -> Result<Vec<Value>> {
+    if out.code != 0 {
+        bail!("herdr pane list exited with code {}", out.code);
+    }
+    let parsed: Value = serde_json::from_str(&out.stdout)?;
+    parsed
+        .pointer("/result/panes")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| anyhow!("herdr pane list gave no panes: {}", out.stdout))
 }
 
 #[cfg(test)]
@@ -223,14 +239,30 @@ mod tests {
     }
 
     #[test]
-    fn tab_create_emits_workspace_and_label() {
-        let r = CliRunner::new(rec(r#"{"result":{"tab":{"tab_id":"1:2"}}}"#, 0));
-        let out = r.tab_create("1", "workers").unwrap();
-        assert!(out.contains("1:2"));
+    fn open_tab_uses_the_source_panes_workspace_and_stays_in_the_background() {
+        // One canned reply answers both calls: the pane list, then the created tab.
+        let r = CliRunner::new(rec(
+            r#"{"result":{"panes":[{"pane_id":"w1:p1","workspace_id":"w1"},{"pane_id":"w2:p1","workspace_id":"w2"}],
+                "root_pane":{"pane_id":"w2:p9"}}}"#, 0,
+        ));
+        assert_eq!(r.open_tab("w2:p1", "task-3", Some("/wt")).unwrap(), "w2:p9");
         assert_eq!(
-            r.exec.calls.borrow()[0].0,
-            vec!["tab","create","--workspace","1","--label","workers"]
+            r.exec.calls.borrow()[1].0,
+            vec!["tab", "create", "--workspace", "w2", "--cwd", "/wt", "--label", "task-3", "--no-focus"]
         );
+    }
+
+    #[test]
+    fn open_tab_fails_when_the_source_pane_is_unknown() {
+        let r = CliRunner::new(rec(r#"{"result":{"panes":[{"pane_id":"w1:p1","workspace_id":"w1"}]}}"#, 0));
+        assert!(r.open_tab("w9:p9", "t", None).is_err());
+        assert_eq!(r.exec.calls.borrow().len(), 1, "no tab should be created");
+    }
+
+    #[test]
+    fn open_tab_fails_when_herdr_gives_no_root_pane() {
+        let r = CliRunner::new(rec(r#"{"result":{"panes":[{"pane_id":"w1:p1","workspace_id":"w1"}]}}"#, 0));
+        assert!(r.open_tab("w1:p1", "t", None).is_err());
     }
 
     #[test]
@@ -327,7 +359,7 @@ mod tests {
         let opts = crate::orchestrate::DispatchOpts {
             context: "x", role: "reviewer", from_pane: "w1:p1", scratch: &dir, task_id: "t",
             vendor: None, unavailable: Default::default(), timeout_ms: 60_000,
-            split_direction: "right", close: false, state_dir: None, reuse_pane: None,
+            split_direction: "right", placement: "split", keep_open: true, headless: false, state_dir: None, reuse_pane: None,
             mode: "headless", interactive: false, model: None, effort: None,
             resume_session: None, cwd: None, exit_grace_ms: 500,
         };

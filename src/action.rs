@@ -40,7 +40,7 @@ pub fn second_opinion_args(ctx: &PluginContext, scratch: &str, context_file: &st
         from_pane: ctx.pane_id.clone().unwrap_or_else(|| "1-1".into()),
         task_id: "second-opinion".into(), scratch: scratch.into(),
         vendor: None, unavailable: String::new(), timeout_ms: 600_000,
-        split_direction: "right".into(), close: false,
+        split_direction: "right".into(), placement: "split".into(), keep_open: true, headless: false,
         state_dir: Some(scratch.into()), reuse_pane: None, interactive: false,
         model: None, effort: None, resume_session: None,
         // This sets no working directory: the pane starts in the launch directory.

@@ -32,10 +32,6 @@ title = "Workers board"
 placement = "overlay"
 command = ["shepherdr", "board"]
 
-[[events]]
-on = "worktree.created"
-command = ["shepherdr", "event", "worktree-created"]
-
 [[keys.command]]
 key = "prefix+r"
 type = "plugin_action"

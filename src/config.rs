@@ -17,6 +17,11 @@ pub struct VendorSpec {
     /// Headless resume template (`{session}`, `{model}`, `{effort}`,
     /// `{prompt}`); `None` when the CLI cannot resume headlessly.
     pub resume_command: Option<String>,
+    /// The CLI's real interface, run in the pane in place of `command` (`{session}`,
+    /// `{settings}`, `{first}`, `{model}`, `{effort}`). `None` means it always runs headless.
+    pub tui_command: Option<String>,
+    /// The same, resuming the session in `{session}`.
+    pub tui_resume_command: Option<String>,
 }
 
 const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -31,6 +36,55 @@ fn cli_name(spec: &VendorSpec) -> &str {
         .unwrap_or("vendor")
 }
 
+fn check_effort(spec: &VendorSpec, effort: Option<&str>) -> anyhow::Result<()> {
+    if let Some(level) = effort {
+        if !EFFORT_LEVELS.contains(&level) {
+            anyhow::bail!(
+                "unknown effort {level:?}; valid levels: {}",
+                EFFORT_LEVELS.join(", ")
+            );
+        }
+        if spec.effort_flag.is_none() {
+            anyhow::bail!("{} does not support --effort", cli_name(spec));
+        }
+    }
+    Ok(())
+}
+
+fn model_and_effort(spec: &VendorSpec, template: &str, model: Option<&str>, effort: Option<&str>) -> String {
+    use crate::protocol::shell_quote;
+    let flag = |flag: &str, value: Option<&str>| {
+        value.map_or(String::new(), |v| format!(" {flag} {}", shell_quote(v)))
+    };
+    template
+        .replace("{model}", &flag(&spec.model_flag, model))
+        .replace("{effort}", &flag(spec.effort_flag.as_deref().unwrap_or(""), effort))
+}
+
+/// Build the command that runs the vendor's real interface, shell-quoting every value.
+/// `resuming` picks whether `session` is continued or created with that ID.
+pub struct TuiRun<'a> {
+    pub first_message: &'a str,
+    pub settings_file: &'a str,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub session: &'a str,
+    pub resuming: bool,
+}
+
+pub fn tui_command(spec: &VendorSpec, run: &TuiRun) -> anyhow::Result<String> {
+    use crate::protocol::shell_quote;
+    check_effort(spec, run.effort)?;
+    let template = if run.resuming { &spec.tui_resume_command } else { &spec.tui_command };
+    let template = template
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{} has no real interface mode", cli_name(spec)))?;
+    Ok(model_and_effort(spec, template, run.model, run.effort)
+        .replace("{session}", &shell_quote(run.session))
+        .replace("{settings}", &shell_quote(run.settings_file))
+        .replace("{first}", &shell_quote(run.first_message)))
+}
+
 /// Build the headless command line, shell-quoting every value.
 pub fn headless_command(
     spec: &VendorSpec,
@@ -41,17 +95,7 @@ pub fn headless_command(
 ) -> anyhow::Result<String> {
     use crate::protocol::shell_quote;
     let cli = cli_name(spec);
-    if let Some(level) = effort {
-        if !EFFORT_LEVELS.contains(&level) {
-            anyhow::bail!(
-                "unknown effort {level:?}; valid levels: {}",
-                EFFORT_LEVELS.join(", ")
-            );
-        }
-        if spec.effort_flag.is_none() {
-            anyhow::bail!("{cli} does not support --effort");
-        }
-    }
+    check_effort(spec, effort)?;
     let template = match resume_session {
         Some(_) => spec
             .resume_command
@@ -59,14 +103,7 @@ pub fn headless_command(
             .ok_or_else(|| anyhow::anyhow!("{cli} cannot resume a session headlessly"))?,
         None => spec.command.as_str(),
     };
-    let flag = |flag: &str, value: Option<&str>| {
-        value.map_or(String::new(), |v| format!(" {flag} {}", shell_quote(v)))
-    };
-    let model_part = flag(&spec.model_flag, model);
-    let effort_part = flag(spec.effort_flag.as_deref().unwrap_or(""), effort);
-    Ok(template
-        .replace("{model}", &model_part)
-        .replace("{effort}", &effort_part)
+    Ok(model_and_effort(spec, template, model, effort)
         .replace("{session}", &shell_quote(resume_session.unwrap_or("")))
         .replace("{prompt}", &shell_quote(prompt_file)))
 }
@@ -88,6 +125,8 @@ fn vendor(
         model_flag: model_flag.into(),
         effort_flag: effort_flag.map(Into::into),
         resume_command: resume_command.map(Into::into),
+        tui_command: None,
+        tui_resume_command: None,
         command: command.into(),
         interactive_command: interactive_command.into(),
         ready_cue: ready_cue.into(),
@@ -100,17 +139,21 @@ pub fn default_config() -> Config {
     roles.insert("reviewer".into(), vec!["codex".into(), "cursor".into()]);
 
     let mut vendors = BTreeMap::new();
-    vendors.insert(
-        "claude".into(),
-        vendor(
+    let mut claude = vendor(
             "cat {prompt} | claude -p{model}{effort} --output-format stream-json --verbose --dangerously-skip-permissions",
             "claude --dangerously-skip-permissions",
             "",
             "--model",
             Some("--effort"),
             Some("cat {prompt} | claude -p --resume {session}{model}{effort} --output-format stream-json --verbose --dangerously-skip-permissions"),
-        ),
     );
+    claude.tui_command = Some(
+        "claude{model}{effort} --session-id {session} --settings {settings} --dangerously-skip-permissions {first}".into(),
+    );
+    claude.tui_resume_command = Some(
+        "claude --resume {session}{model}{effort} --settings {settings} --dangerously-skip-permissions {first}".into(),
+    );
+    vendors.insert("claude".into(), claude);
     vendors.insert(
         "codex".into(),
         vendor(

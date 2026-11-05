@@ -38,7 +38,7 @@ esac
 # $$ survives the exec, so agent.pid names the sleeping process.
 AGENT_STUB = """#!/bin/sh
 stub_dir="$(dirname "$0")"
-cat > "$stub_dir/agent.stdin"
+if [ -t 0 ]; then printf '%s' "$*" > "$stub_dir/agent.stdin"; else cat > "$stub_dir/agent.stdin"; fi
 echo '{"type":"system","session_id":"stub-session"}'
 echo $$ > "$stub_dir/agent.pid"
 case "$STUB_AGENT" in
@@ -69,7 +69,7 @@ class Fixture:
         self.pid_file = os.path.join(self.stubs, "agent.pid")
         self.stdin_file = os.path.join(self.stubs, "agent.stdin")
 
-    def pane_command(self, task_id, reuse):
+    def pane_command(self, task_id, reuse, headless=True):
         """Ask the real binary for the command it would send to the pane."""
         command_file = os.path.join(self.base, "command")
         context = os.path.join(self.scratch, f"{task_id}.context.md")
@@ -79,8 +79,10 @@ class Fixture:
             BIN, "dispatch", "--role", "implementer", "--vendor", "claude",
             "--model", "stub", "--timeout-ms", "1", "--from-pane", "stub:p1",
             "--task-id", task_id, "--context-file", context,
-            "--scratch", self.scratch, "--cwd", self.worktree,
+            "--scratch", self.scratch, "--cwd", self.worktree, "--placement", "split",
         ]
+        if headless:
+            args += ["--headless"]
         if reuse:
             args += ["--reuse-pane", "stub:p9"]
         env = dict(os.environ, HERDR_BIN_PATH=os.path.join(self.stubs, "herdr"),
@@ -205,9 +207,9 @@ CASES = [
 ]
 
 
-def run_case(fixture, shell, argv, name, mode, action, number):
-    task_id = f"{shell}-{number}"
-    command = fixture.pane_command(task_id, reuse=False)
+def run_case(fixture, shell, argv, name, mode, action, number, headless):
+    task_id = f"{shell}-{number}-{'headless' if headless else 'real'}"
+    command = fixture.pane_command(task_id, reuse=False, headless=headless)
     marker = os.path.join(fixture.scratch, f"{task_id}.exited")
     log = os.path.join(fixture.scratch, f"{task_id}.log")
     for path in (fixture.pid_file, fixture.stdin_file):
@@ -224,14 +226,17 @@ def run_case(fixture, shell, argv, name, mode, action, number):
             problems.append("no marker")
         pane.wait_path(fixture.stdin_file, 1.0)
         with open(fixture.stdin_file) as f:
-            if f"DONE::{task_id}" not in f.read():
+            # The real interface gets a pointer to the prompt file, on a terminal.
+            expected = f"DONE::{task_id}" if headless else f"{task_id}.prompt.md"
+            if expected not in f.read():
                 problems.append("prompt did not reach the agent")
-        if os.path.exists(log):
-            with open(log) as f:
-                if "stub-session" not in f.read():
-                    problems.append("session line missing from the log")
-        else:
-            problems.append("no log")
+        if headless:
+            if os.path.exists(log):
+                with open(log) as f:
+                    if "stub-session" not in f.read():
+                        problems.append("session line missing from the log")
+            else:
+                problems.append("no log")
         if action in (ctrl_c, nothing):
             pane.output = b""
             pane.send('echo "ALIVE:$((40+2))"\n')
@@ -242,9 +247,9 @@ def run_case(fixture, shell, argv, name, mode, action, number):
         pane.destroy()
 
 
-def run_failed_cd(fixture, shell, argv):
-    task_id = f"{shell}-cd"
-    command = fixture.pane_command(task_id, reuse=True)
+def run_failed_cd(fixture, shell, argv, headless):
+    task_id = f"{shell}-cd-{'headless' if headless else 'real'}"
+    command = fixture.pane_command(task_id, reuse=True, headless=headless)
     if "cd " not in command:
         return ["reuse-pane command has no cd"]
     marker = os.path.join(fixture.scratch, f"{task_id}.exited")
@@ -266,10 +271,10 @@ def run_failed_cd(fixture, shell, argv):
         os.rename(moved, fixture.worktree)
 
 
-def run_term_to_wrapper_only(fixture, shell, argv):
+def run_term_to_wrapper_only(fixture, shell, argv, headless):
     """A signal to the wrapper alone leaves the agent running, so no marker yet."""
-    task_id = f"{shell}-wrapper"
-    command = fixture.pane_command(task_id, reuse=False)
+    task_id = f"{shell}-wrapper-{'headless' if headless else 'real'}"
+    command = fixture.pane_command(task_id, reuse=False, headless=headless)
     marker = os.path.join(fixture.scratch, f"{task_id}.exited")
     if os.path.exists(fixture.pid_file):
         os.remove(fixture.pid_file)
@@ -307,12 +312,14 @@ def main():
     try:
         fixture = Fixture(base)
         print("pane command:", fixture.pane_command("sample", reuse=True))
-        for shell, argv in SHELLS:
-            for number, (name, mode, action) in enumerate(CASES):
-                report(shell, name, run_case(fixture, shell, argv, name, mode, action, number))
-            report(shell, "reuse-pane cd fails", run_failed_cd(fixture, shell, argv))
-            report(shell, "SIGTERM to the wrapper alone waits for the agent",
-                   run_term_to_wrapper_only(fixture, shell, argv))
+        for headless, kind in ((True, "headless"), (False, "real interface")):
+            for shell, argv in SHELLS:
+                for number, (name, mode, action) in enumerate(CASES):
+                    report(shell, f"{kind}: {name}",
+                           run_case(fixture, shell, argv, name, mode, action, number, headless))
+                report(shell, f"{kind}: reuse-pane cd fails", run_failed_cd(fixture, shell, argv, headless))
+                report(shell, f"{kind}: SIGTERM to the wrapper alone waits for the agent",
+                       run_term_to_wrapper_only(fixture, shell, argv, headless))
     finally:
         shutil.rmtree(base, ignore_errors=True)
     print(f"failures: {failures}")

@@ -2,11 +2,11 @@
 
 shepherdr changes one thing about [superpowers](https://github.com/obra/superpowers): where code-writing subagents run. Superpowers' stock steps run unchanged. During `superpowers:subagent-driven-development`, each subagent that writes code runs in a visible herdr pane via `shepherdr dispatch`, which you can watch, resume, and take over. Reviewers stay native. Implementers in this flow are Claude only.
 
-The skill that does this is `dispatching-implementers-to-herdr`. It maps each stock SDD dispatch or resume of an implementer onto `shepherdr dispatch` with `--model` (required), optional `--effort`, `--resume-session` and `--cwd`. Read its JSON output: `session_id`, `pane_id`, `log_file` and `agent_exited`. Status `failed` means the agent exited without a complete result.
+The skill that does this is `dispatching-implementers-to-herdr`. It maps each stock SDD dispatch or resume of an implementer onto `shepherdr dispatch` with `--model` (required), optional `--effort`, `--resume-session` and `--cwd`. Each implementer runs Claude's real interface in its own background tab, which closes after a clean finish. Read the JSON output: `session_id`, `pane_id`, `log_file` and `agent_exited`. Status `failed` means the agent stopped without a complete result.
 
 `--effort` is claude-only. Without it, a pane agent runs at claude's configured default effort, not the controller's.
 
-Dispatched agents still run with permission checks bypassed (`--dangerously-skip-permissions` for claude). This is deliberate so they can do the work, but only run it on repos and tasks you are comfortable letting an agent operate on unattended.
+Dispatched agents still run with permission checks bypassed (`--dangerously-skip-permissions` for claude), and a folder Claude has not been told to trust stops at a prompt until you answer it. Git worktrees of a trusted repo did not prompt in our testing. Bypassing checks is deliberate so they can do the work, but only run it on repos and tasks you are comfortable letting an agent operate on unattended.
 
 Exit codes: `0` done, `3` degraded, `2` timeout or failed, `1` usage or herdr error.
 

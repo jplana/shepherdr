@@ -4,7 +4,6 @@ pub mod action;
 pub mod board;
 pub mod cli;
 pub mod config;
-pub mod event;
 pub mod orchestrate;
 pub mod protocol;
 pub mod runner;
