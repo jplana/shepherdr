@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 pub struct VendorSpec {
-    /// Headless invocation: `cat {prompt} | <cli> ...` (autonomy flags).
+    /// Headless invocation: `cat {prompt} | <cli> ...`.
     pub command: String,
-    /// Bare interactive TUI launch with gate-bypass flags (no prompt piped).
+    /// Bare interactive TUI launch, for you to drive (no prompt piped).
     pub interactive_command: String,
     /// Substring signalling the TUI is ready for input. Empty means "treat
     /// any non-empty visible output as ready" (with a timeout fallback);
@@ -22,6 +22,11 @@ pub struct VendorSpec {
     pub tui_command: Option<String>,
     /// The same, resuming the session in `{session}`.
     pub tui_resume_command: Option<String>,
+    /// Headless run that can't change anything (`{result}`), where the CLI itself saves
+    /// the final message to the result file. `None` means no such mode.
+    pub read_only_command: Option<String>,
+    /// The same, resuming the session in `{session}`.
+    pub read_only_resume_command: Option<String>,
 }
 
 const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -85,6 +90,28 @@ pub fn tui_command(spec: &VendorSpec, run: &TuiRun) -> anyhow::Result<String> {
         .replace("{first}", &shell_quote(run.first_message)))
 }
 
+/// Build the read-only headless command, if the vendor has that mode.
+pub fn read_only_command(
+    spec: &VendorSpec,
+    prompt_file: &str,
+    result_file: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    resume_session: Option<&str>,
+) -> Option<anyhow::Result<String>> {
+    use crate::protocol::shell_quote;
+    let template = match resume_session {
+        Some(_) => spec.read_only_resume_command.as_deref()?,
+        None => spec.read_only_command.as_deref()?,
+    };
+    Some(check_effort(spec, effort).map(|()| {
+        model_and_effort(spec, template, model, effort)
+            .replace("{session}", &shell_quote(resume_session.unwrap_or("")))
+            .replace("{result}", &shell_quote(result_file))
+            .replace("{prompt}", &shell_quote(prompt_file))
+    }))
+}
+
 /// Build the headless command line, shell-quoting every value.
 pub fn headless_command(
     spec: &VendorSpec,
@@ -103,8 +130,18 @@ pub fn headless_command(
             .ok_or_else(|| anyhow::anyhow!("{cli} cannot resume a session headlessly"))?,
         None => spec.command.as_str(),
     };
+    // The agent writes its result file next to the prompt, so its sandbox must allow that.
+    let scratch = std::path::Path::new(prompt_file)
+        .parent()
+        .map_or(String::new(), |dir| dir.to_string_lossy().into_owned());
+    let roots = format!(
+        "sandbox_workspace_write.writable_roots=[{}]",
+        serde_json::Value::from(scratch.as_str()),
+    );
     Ok(model_and_effort(spec, template, model, effort)
         .replace("{session}", &shell_quote(resume_session.unwrap_or("")))
+        .replace("{scratch}", &shell_quote(&scratch))
+        .replace("{writable_roots}", &shell_quote(&roots))
         .replace("{prompt}", &shell_quote(prompt_file)))
 }
 
@@ -127,6 +164,8 @@ fn vendor(
         resume_command: resume_command.map(Into::into),
         tui_command: None,
         tui_resume_command: None,
+        read_only_command: None,
+        read_only_resume_command: None,
         command: command.into(),
         interactive_command: interactive_command.into(),
         ready_cue: ready_cue.into(),
@@ -140,31 +179,36 @@ pub fn default_config() -> Config {
 
     let mut vendors = BTreeMap::new();
     let mut claude = vendor(
-            "cat {prompt} | claude -p{model}{effort} --output-format stream-json --verbose --dangerously-skip-permissions",
-            "claude --dangerously-skip-permissions",
+            "cat {prompt} | claude -p{model}{effort} --output-format stream-json --verbose --permission-mode auto",
+            "claude",
             "",
             "--model",
             Some("--effort"),
-            Some("cat {prompt} | claude -p --resume {session}{model}{effort} --output-format stream-json --verbose --dangerously-skip-permissions"),
+            Some("cat {prompt} | claude -p --resume {session}{model}{effort} --output-format stream-json --verbose --permission-mode auto"),
     );
     claude.tui_command = Some(
-        "claude{model}{effort} --session-id {session} --settings {settings} --dangerously-skip-permissions {first}".into(),
+        "claude{model}{effort} --session-id {session} --settings {settings} --permission-mode auto {first}".into(),
     );
     claude.tui_resume_command = Some(
-        "claude --resume {session}{model}{effort} --settings {settings} --dangerously-skip-permissions {first}".into(),
+        "claude --resume {session}{model}{effort} --settings {settings} --permission-mode auto {first}".into(),
     );
     vendors.insert("claude".into(), claude);
-    vendors.insert(
-        "codex".into(),
-        vendor(
-            "cat {prompt} | codex exec{model} --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
-            "codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
-            "",
-            "-m",
-            None,
-            Some("cat {prompt} | codex exec resume --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust{model} {session} -"),
-        ),
+    // The sandbox flags differ on resume because `codex exec resume` only takes `-c`.
+    let mut codex = vendor(
+        "cat {prompt} | codex exec{model} --skip-git-repo-check --sandbox workspace-write --add-dir {scratch}",
+        "codex",
+        "",
+        "-m",
+        None,
+        Some("cat {prompt} | codex exec resume --skip-git-repo-check -c 'sandbox_mode=\"workspace-write\"' -c {writable_roots}{model} {session} -"),
     );
+    codex.read_only_command = Some(
+        "cat {prompt} | codex exec{model} --skip-git-repo-check --sandbox read-only --output-last-message {result}".into(),
+    );
+    codex.read_only_resume_command = Some(
+        "cat {prompt} | codex exec resume --skip-git-repo-check -c 'sandbox_mode=\"read-only\"' --output-last-message {result}{model} {session} -".into(),
+    );
+    vendors.insert("codex".into(), codex);
     vendors.insert(
         "cursor".into(),
         vendor(
@@ -221,22 +265,17 @@ mod tests {
     }
 
     #[test]
-    fn interactive_commands_launch_bare_tui_with_bypass() {
+    fn interactive_commands_are_the_bare_clis_for_you_to_drive() {
         let config = default_config();
-        assert!(config.vendors["claude"].interactive_command.contains("claude"));
-        assert!(config.vendors["claude"].interactive_command.contains("--dangerously-skip-permissions"));
-        // no headless `-p` print flag (as a space-delimited token; the bare
-        // string "-p" also matches inside "--dangerously-skip-permissions").
-        assert!(!config.vendors["claude"].interactive_command.contains(" -p"));
-        assert!(config.vendors["codex"].interactive_command.contains("--dangerously-bypass-approvals-and-sandbox"));
-        assert!(config.vendors["cursor"].interactive_command.contains("--force"));
+        assert_eq!(config.vendors["claude"].interactive_command, "claude");
+        assert_eq!(config.vendors["codex"].interactive_command, "codex");
     }
 
     #[test]
     fn vendor_commands_run_autonomously() {
         let config = default_config();
-        assert!(config.vendors["claude"].command.contains("--dangerously-skip-permissions"));
-        assert!(config.vendors["codex"].command.contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(config.vendors["claude"].command.contains("--permission-mode auto"));
+        assert!(config.vendors["codex"].command.contains("--sandbox workspace-write"));
         assert!(config.vendors["codex"].command.contains("--skip-git-repo-check"));
         assert!(config.vendors["cursor"].command.contains("--force"));
     }
@@ -270,7 +309,7 @@ mod tests {
         let c = headless_command(&cfg("claude"), "/s/p.md", None, None, Some("sess-1")).unwrap();
         assert!(c.contains("claude -p --resume 'sess-1'"));
         assert!(c.contains("--output-format stream-json"));
-        assert!(c.contains("--dangerously-skip-permissions"));
+        assert!(c.contains("--permission-mode auto"));
     }
 
     #[test]
@@ -278,10 +317,8 @@ mod tests {
         let c = headless_command(&cfg("codex"), "/s/p.md", None, None, Some("sess-1")).unwrap();
         assert!(c.ends_with("'sess-1' -"));
         assert!(c.contains("codex exec resume"));
-        for f in ["--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust"] {
-            assert!(c.contains(f));
-            assert!(cfg("codex").command.contains(f));
-        }
+        assert!(c.contains("--skip-git-repo-check"));
+        assert!(cfg("codex").command.contains("--skip-git-repo-check"));
     }
 
     #[test]
@@ -332,5 +369,69 @@ mod tests {
             assert!(e.contains(v) && e.contains("--effort"));
             assert!(!headless_command(&s, "/p", None, None, None).unwrap().contains("{effort}"));
         }
+    }
+
+    #[test]
+    fn no_claude_or_codex_command_bypasses_permissions_or_trust() {
+        for name in ["claude", "codex"] {
+            let spec = cfg(name);
+            for template in [
+                Some(&spec.command), Some(&spec.interactive_command), spec.resume_command.as_ref(),
+                spec.tui_command.as_ref(), spec.tui_resume_command.as_ref(),
+                spec.read_only_command.as_ref(), spec.read_only_resume_command.as_ref(),
+            ].into_iter().flatten() {
+                assert!(!template.contains("dangerously"), "{name}: {template}");
+                assert!(!template.contains("full-auto"), "{name}: {template}");
+            }
+        }
+    }
+
+    #[test]
+    fn claudes_real_interface_runs_in_auto_mode_new_and_resumed() {
+        for resuming in [false, true] {
+            let c = tui_command(&cfg("claude"), &TuiRun {
+                first_message: "go", settings_file: "/s/x.json", model: None, effort: None,
+                session: "sess", resuming,
+            }).unwrap();
+            assert!(c.contains("--permission-mode auto"), "was: {c}");
+        }
+    }
+
+    #[test]
+    fn a_codex_implementer_can_write_its_workspace_and_the_scratch_dir_only() {
+        let c = headless_command(&cfg("codex"), "/s c/p.md", None, None, None).unwrap();
+        assert!(c.contains("--sandbox workspace-write"), "was: {c}");
+        assert!(c.contains("--add-dir '/s c'"), "was: {c}");
+    }
+
+    #[test]
+    fn a_resumed_codex_implementer_keeps_the_same_sandbox() {
+        let c = headless_command(&cfg("codex"), "/s/p.md", None, None, Some("sess")).unwrap();
+        assert!(c.contains(r#"-c 'sandbox_mode="workspace-write"'"#), "was: {c}");
+        assert!(c.contains(r#"-c 'sandbox_workspace_write.writable_roots=["/s"]'"#), "was: {c}");
+    }
+
+    #[test]
+    fn a_hostile_scratch_path_stays_one_shell_word_in_the_resumed_sandbox() {
+        let c = headless_command(&cfg("codex"), "/s'\"x/p.md", None, None, Some("sess")).unwrap();
+        assert!(c.contains(r#"writable_roots=["/s'\''\"x"]'"#), "was: {c}");
+    }
+
+    #[test]
+    fn a_codex_reviewer_is_read_only_and_codex_itself_saves_the_answer() {
+        let spec = cfg("codex");
+        let new = read_only_command(&spec, "/s/p.md", "/s/r.md", Some("o3"), None, None).unwrap().unwrap();
+        assert!(new.contains("--sandbox read-only"), "was: {new}");
+        assert!(new.contains("--output-last-message '/s/r.md'"), "was: {new}");
+        assert!(new.contains("-m 'o3'"), "was: {new}");
+        let resumed = read_only_command(&spec, "/s/p.md", "/s/r.md", None, None, Some("sess")).unwrap().unwrap();
+        assert!(resumed.contains(r#"-c 'sandbox_mode="read-only"'"#), "was: {resumed}");
+        assert!(resumed.contains("--output-last-message '/s/r.md'"), "was: {resumed}");
+        assert!(resumed.ends_with("'sess' -"), "was: {resumed}");
+    }
+
+    #[test]
+    fn a_vendor_with_no_read_only_mode_says_so() {
+        assert!(read_only_command(&cfg("cursor"), "/p", "/r", None, None, None).is_none());
     }
 }

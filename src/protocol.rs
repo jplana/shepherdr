@@ -34,15 +34,33 @@ pub fn turn_failed_path(scratch: &Path, task_id: &str) -> PathBuf {
     scratch.join(format!("{task_id}.stopfailure.json"))
 }
 
-/// Claude settings whose hooks save each hook's JSON input to the given files. The
-/// rename means a reader never sees half a file.
+const REFUSAL: &str = "No one is available to approve this. Do not retry it or look for a way \
+around it. Carry on if you can; otherwise report status BLOCKED and name what was refused.";
+
+/// Claude settings whose hooks save each turn's outcome to the given files and refuse
+/// every permission prompt. The rename means a reader never sees half a file.
 pub fn hook_settings(turn_ended: &Path, turn_failed: &Path) -> String {
     let save = |path: &Path| {
         let target = shell_quote(&path.to_string_lossy());
         let partial = shell_quote(&format!("{}.partial", path.to_string_lossy()));
         serde_json::json!([{ "hooks": [{ "type": "command", "command": format!("cat > {partial} && mv {partial} {target}") }] }])
     };
-    serde_json::json!({ "hooks": { "Stop": save(turn_ended), "StopFailure": save(turn_failed) } }).to_string()
+    let refusal = serde_json::json!({ "hookSpecificOutput": {
+        "hookEventName": "PermissionRequest",
+        "decision": { "behavior": "deny", "message": REFUSAL },
+    }})
+    .to_string();
+    // Nobody is watching a background tab, so a prompt would otherwise wait forever.
+    let refuse = serde_json::json!([{ "hooks": [{
+        "type": "command",
+        "command": format!("printf %s {}", shell_quote(&refusal)),
+    }] }]);
+    serde_json::json!({ "hooks": {
+        "Stop": save(turn_ended),
+        "StopFailure": save(turn_failed),
+        "PermissionRequest": refuse,
+    } })
+    .to_string()
 }
 
 /// What the real interface is told to do. The task itself stays in the prompt file,
@@ -104,6 +122,15 @@ pub fn pane_command(cd_to: Option<&str>, base: &str, log_file: Option<&str>, mar
 {cd}{base}{logged}",
     );
     format!("clear; sh -c {} sh {}", shell_quote(&script), shell_quote(marker))
+}
+
+/// The prompt for an agent that can't write files. Its final message becomes the result.
+pub fn build_read_only_prompt(context: &str) -> String {
+    format!(
+        "{}\n\n---\nYou are in a read-only sandbox. Reply with your complete result as your \
+final message, and do not try to write any file.",
+        context.trim_end(),
+    )
 }
 
 pub fn build_prompt(context: &str, task_id: &str, result_file: &str, role: &str) -> String {

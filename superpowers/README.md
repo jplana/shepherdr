@@ -6,7 +6,7 @@ The skill that does this is `dispatching-implementers-to-herdr`. It maps each st
 
 `--effort` is claude-only. Without it, a pane agent runs at claude's configured default effort, not the controller's.
 
-Dispatched agents still run with permission checks bypassed (`--dangerously-skip-permissions` for claude), and a folder Claude has not been told to trust stops at a prompt until you answer it. Git worktrees of a trusted repo did not prompt in our testing. Bypassing checks is deliberate so they can do the work, but only run it on repos and tasks you are comfortable letting an agent operate on unattended.
+Implementers run in Claude's auto mode, with no bypass flag. A hook answers any permission prompt with "no", so a blocked agent reports `BLOCKED` through the normal flow instead of waiting in a background tab. Claude's OS sandbox is not enabled, so what auto mode allows runs with your user's access. A folder Claude has not been told to trust stops at a prompt until you answer it; git worktrees of a trusted repo did not prompt in our testing.
 
 Exit codes: `0` done, `3` degraded, `2` timeout or failed, `1` usage or herdr error.
 
