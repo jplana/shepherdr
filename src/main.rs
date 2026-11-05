@@ -11,7 +11,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Agent-initiated dispatch (called by the superpowers overlays).
+    /// Agent-initiated dispatch (called by the dispatching-implementers-to-herdr skill).
     Dispatch(Box<DispatchArgs>),
     /// Reopen a finished dispatch's agent session in a headed pane.
     Resume(ResumeArgs),
@@ -63,7 +63,6 @@ fn main() {
             let ctx_json = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
             let ctx = shepherdr::action::parse_context(&ctx_json);
             let scratch = std::env::var("HERDR_PLUGIN_STATE_DIR").unwrap_or_else(|_| ".".into());
-            let from_pane = ctx.pane_id.clone().unwrap_or_else(|| "1-1".into());
             let context = shepherdr::action::second_opinion_context(&ctx);
             let ctx_file = std::path::Path::new(&scratch).join("second-opinion.context.md");
             if let Err(e) = std::fs::create_dir_all(&scratch) {
@@ -74,14 +73,7 @@ fn main() {
                 eprintln!("action error: {e}");
                 std::process::exit(1);
             }
-            let args = DispatchArgs {
-                role: "reviewer".into(), context_file: ctx_file.to_string_lossy().into(),
-                from_pane, task_id: "second-opinion".into(), scratch: scratch.clone(),
-                vendor: None, unavailable: String::new(), timeout_ms: 600_000,
-                split_direction: "right".into(), close: false,
-                state_dir: Some(scratch), reuse_pane: None, interactive: false,
-                model: None, effort: None, resume_session: None, cwd: None,
-            };
+            let args = shepherdr::action::second_opinion_args(&ctx, &scratch, &ctx_file.to_string_lossy());
             let runner = CliRunner::system();
             match run_dispatch(&args, &runner) {
                 Ok(r) => {

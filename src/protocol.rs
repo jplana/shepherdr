@@ -75,13 +75,17 @@ pub fn pane_command(cd_to: Option<&str>, base: &str, log_file: &str, marker: &st
 
 pub fn build_prompt(context: &str, task_id: &str, result_file: &str, role: &str) -> String {
     let implementer = role == "implementer";
-    let (head, what) = if implementer {
-        ("You are a subagent dispatched to execute one specific task.\n\n", "the message you would report back")
+    let (head, also_when, what) = if implementer {
+        (
+            "You are a subagent dispatched to execute one specific task.\n\n",
+            ", or when you stop early to ask a question or report being blocked",
+            "the message you would report back",
+        )
     } else {
-        ("", "your complete result")
+        ("", "", "your complete result")
     };
     format!(
-        "{head}{context}\n\n---\nWhen you have finished the task above, write {what} \
+        "{head}{context}\n\n---\nWhen you have finished the task above{also_when}, write {what} \
 to the file `{result_file}` (overwrite it if it exists). The \
 very last line of that file must be exactly:\n\n{sentinel}",
         context = context.trim_end(),
@@ -315,6 +319,22 @@ mod tests {
         assert!(out.contains("write the message you would report back to the file `/s/t1.result.md`"), "was: {out}");
         assert!(!out.contains("complete result"), "was: {out}");
         assert!(out.ends_with("DONE::t1"));
+    }
+
+    #[test]
+    fn implementer_footer_covers_stopping_early() {
+        let out = build_prompt("Do it.", "t1", "/s/t1.result.md", "implementer");
+        assert!(
+            out.contains("When you have finished the task above, or when you stop early to ask a question or report being blocked, write the message you would report back to the file `/s/t1.result.md`"),
+            "was: {out}"
+        );
+    }
+
+    #[test]
+    fn non_implementer_prompt_is_byte_for_byte_unchanged() {
+        let want = "Do it.\n\n---\nWhen you have finished the task above, write your complete result \
+to the file `/s/t1.result.md` (overwrite it if it exists). The very last line of that file must be exactly:\n\nDONE::t1";
+        assert_eq!(build_prompt("Do it.", "t1", "/s/t1.result.md", "reviewer"), want);
     }
 
     #[test]

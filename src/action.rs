@@ -1,3 +1,4 @@
+use crate::cli::DispatchArgs;
 use serde_json::Value;
 
 pub struct PluginContext {
@@ -32,6 +33,21 @@ unstated assumptions. Be concise and reference file:line.",
     )
 }
 
+/// The dispatch the `second-opinion` action runs, in the context's worktree when
+/// it has one.
+pub fn second_opinion_args(ctx: &PluginContext, scratch: &str, context_file: &str) -> DispatchArgs {
+    DispatchArgs {
+        role: "reviewer".into(), context_file: context_file.into(),
+        from_pane: ctx.pane_id.clone().unwrap_or_else(|| "1-1".into()),
+        task_id: "second-opinion".into(), scratch: scratch.into(),
+        vendor: None, unavailable: String::new(), timeout_ms: 600_000,
+        split_direction: "right".into(), close: false,
+        state_dir: Some(scratch.into()), reuse_pane: None, interactive: false,
+        model: None, effort: None, resume_session: None,
+        cwd: ctx.worktree_path.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +76,25 @@ mod tests {
         assert!(c.workspace_id.is_none());
         assert!(c.pane_id.is_none());
         assert!(c.worktree_path.is_none());
+    }
+
+    #[test]
+    fn second_opinion_runs_in_the_context_worktree() {
+        let ctx = parse_context(r#"{"focused_pane":{"pane_id":"1-2"},"worktree":{"path":"/repo/wt"}}"#);
+        let args = second_opinion_args(&ctx, "/state", "/state/ctx.md");
+        assert_eq!(args.cwd.as_deref(), Some("/repo/wt"));
+        assert_eq!(args.from_pane, "1-2");
+        assert_eq!(args.role, "reviewer");
+        assert_eq!(args.context_file, "/state/ctx.md");
+        assert_eq!(args.scratch, "/state");
+        assert_eq!(args.state_dir.as_deref(), Some("/state"));
+    }
+
+    #[test]
+    fn second_opinion_without_a_worktree_leaves_cwd_unset() {
+        let args = second_opinion_args(&parse_context("{}"), "/state", "/state/ctx.md");
+        assert!(args.cwd.is_none());
+        assert_eq!(args.from_pane, "1-1");
     }
 
     #[test]
