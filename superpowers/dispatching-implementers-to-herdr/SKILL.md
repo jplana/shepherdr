@@ -17,7 +17,7 @@ When stock SDD says to dispatch or resume an implementer, run `shepherdr dispatc
 | Record the implementer's identity | Record `session_id`, `pane_id` and `agent_exited` from the JSON output. |
 | Fix rounds 1-3: resume the implementer; also answering NEEDS_CONTEXT | The same command plus `--resume-session <session_id>`, with the findings or answer as the context file. Add `--reuse-pane <pane_id>` only if the previous dispatch returned `agent_exited: true`; otherwise use a new pane. |
 | No resume possible (`session_id` is null) | Stock's own fallback: dispatch a fresh implementer with the brief path, report path and findings. |
-| Fix rounds 4-5: fresh implementer on a more capable model | A dispatch without `--resume-session`, with the higher `--model`. The context file carries the brief path, report path and findings. |
+| Fix rounds 4-5: fresh implementer on a more capable model | Write a new context file naming the brief path, report path and findings, and pass that as `--context-file`. Then a dispatch without `--resume-session`, with the higher `--model`. |
 | Final-review fix subagent | A fresh dispatch, because it writes code. Any stock subagent that writes code counts as an implementer; any that only reads stays native. |
 | Wait for the implementer | Stock's waiting rule applies; the dispatch is a background command that reports when it exits. |
 | `status: failed` (agent exited without a complete result) | Read the task log, then handle as stock's BLOCKED. |
