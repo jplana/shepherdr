@@ -41,7 +41,7 @@ standard-tier `sonnet` implementer). The previous dispatch returned
 `{"status":"done","session_id":"abc-123","pane_id":"w1-5","agent_exited":true}`.
 Findings are in `/work/demo-wt/.superpowers/sdd/demo/task-3-findings-r4.md`. Send the fixes.
 
-Expected: fresh dispatch, no `--resume-session`, higher model (`opus`).
+Expected: fresh dispatch, no `--resume-session`, higher model (`opus`), and a context file naming the brief, report and findings.
 
 ## 6
 All tasks are done. The final whole-implementation review found issues that need
