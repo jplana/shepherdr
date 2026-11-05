@@ -131,9 +131,8 @@ pub fn dispatch<R: HerdrRunner>(
     // in headless agent output can spoof a scrollback-matched sentinel, so
     // completion is detected by polling the result file itself rather than
     // watching the pane.
-    let quoted_prompt = protocol::shell_quote(&prompt_file.to_string_lossy());
     let quoted_log = protocol::shell_quote(&log_file.to_string_lossy());
-    let base = spec.command.replace("{prompt}", &quoted_prompt);
+    let base = crate::config::headless_command(spec, &prompt_file.to_string_lossy(), None, None, None)?;
     let command = format!("{base} 2>&1 | tee {quoted_log}");
     runner.run(&pane_id, &command)?;
 
