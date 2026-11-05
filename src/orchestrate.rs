@@ -342,8 +342,24 @@ pub fn dispatch<R: HerdrRunner>(
     } else {
         None
     };
+    // The CLI saves a read-only agent's final message, so there is no result marker.
+    let read_only_base = if opts.interactive || opts.role != "reviewer" {
+        None
+    } else {
+        crate::config::read_only_command(
+            spec,
+            &prompt_file.to_string_lossy(),
+            &result_file.to_string_lossy(),
+            opts.model,
+            opts.effort,
+            opts.resume_session,
+        )
+        .transpose()?
+    };
+    let read_only = read_only_base.is_some();
     let base_command = match (&tui_session, opts.interactive) {
         (_, true) => None,
+        _ if read_only => read_only_base,
         (Some(session), _) => Some(crate::config::tui_command(spec, &crate::config::TuiRun {
             first_message: &protocol::first_message(&prompt_file),
             settings_file: &settings_file.to_string_lossy(),
@@ -378,10 +394,12 @@ pub fn dispatch<R: HerdrRunner>(
     if tui_session.is_some() {
         std::fs::write(&settings_file, protocol::hook_settings(&turn_ended_file, &turn_failed_file))?;
     }
-    std::fs::write(
-        &prompt_file,
-        protocol::build_prompt(opts.context, opts.task_id, &result_file.to_string_lossy(), opts.role),
-    )?;
+    let prompt = if read_only {
+        protocol::build_read_only_prompt(opts.context)
+    } else {
+        protocol::build_prompt(opts.context, opts.task_id, &result_file.to_string_lossy(), opts.role)
+    };
+    std::fs::write(&prompt_file, prompt)?;
     record(opts, &vendor, "", "dispatched", &created_at, None, &cwd);
 
     let Some(base) = base_command else {
@@ -444,7 +462,9 @@ pub fn dispatch<R: HerdrRunner>(
             r
         }
         HeadlessOutcome::Exited => {
-            let mut r = match protocol::read_lossy(&result_file) {
+            let saved = protocol::read_lossy(&result_file);
+            let mut r = match saved.filter(|t| !read_only || !t.trim().is_empty()) {
+                Some(t) if read_only => mk("done", "file", t.trim().to_string()),
                 Some(t) => mk("failed", "file", tail(&t)),
                 // The real interface has no log, so the pane is all there is to show.
                 None if tui_session.is_some() => {
@@ -650,6 +670,8 @@ mod tests {
         turn_failure: Option<String>,
         /// the agent leaves its exit marker when it is sent /exit
         quits: bool,
+        /// what a read-only CLI saves to the result file when it exits
+        final_message: Option<String>,
     }
     impl HerdrRunner for FakeRunner {
         fn split(&self, _p: &str, _d: &str, _f: bool, cwd: Option<&str>) -> anyhow::Result<String> {
@@ -688,6 +710,9 @@ mod tests {
                 match &self.log_bytes {
                     Some(bytes) => std::fs::write(log, bytes).unwrap(),
                     None => std::fs::write(log, &self.log_text).unwrap(),
+                }
+                if let Some(text) = &self.final_message {
+                    std::fs::write(result_path(&self.scratch, &self.task_id), text).unwrap();
                 }
                 if let Some(payload) = &self.turn_end {
                     std::fs::write(self.scratch.join(format!("{}.stop.json", self.task_id)), payload).unwrap();
@@ -773,6 +798,7 @@ mod tests {
             turn_end: None,
             turn_failure: None,
             quits: false,
+            final_message: None,
         }
     }
 
@@ -1001,6 +1027,7 @@ mod tests {
         let mut r = fake(&dir, "rev-ep", WriteMode::Incomplete, "half done");
         r.exits = true;
         let mut o = opts(&dir, "rev-ep");
+        o.vendor = Some("cursor");
         o.timeout_ms = 60_000;
         let out = dispatch(&r, &default_config(), &o).unwrap();
         assert_eq!(out.status, "failed");
@@ -1137,6 +1164,7 @@ mod tests {
         let mut r = fake(&dir, "rev-gp", WriteMode::Incomplete, "half done");
         r.pane_gone_from_call = Some(1);
         let mut o = opts(&dir, "rev-gp");
+        o.vendor = Some("cursor");
         o.timeout_ms = 1500;
         let out = dispatch(&r, &default_config(), &o).unwrap();
         assert_eq!(out.status, "failed");
@@ -1277,7 +1305,8 @@ mod tests {
         assert!(!c.contains(" -p"), "was: {c}");
         assert!(!c.contains("tee "), "piping would stop it being a terminal: {c}");
         assert!(!c.contains("cat "), "stdin must stay the terminal: {c}");
-        assert!(c.contains("--dangerously-skip-permissions"), "was: {c}");
+        assert!(c.contains("--permission-mode auto"), "was: {c}");
+        assert!(!c.contains("dangerously"), "was: {c}");
         let session = out.session_id.clone().unwrap();
         assert_eq!(session.len(), 36, "was: {session}");
         assert!(c.contains(&session), "the id reported must be the one used: {c}");
@@ -1354,6 +1383,79 @@ mod tests {
             child.wait().unwrap();
             assert_eq!(std::fs::read_to_string(dir.join(file)).unwrap(), "{\"payload\":1}", "{event}");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_permission_prompt_is_answered_no_so_the_agent_never_waits_on_it() {
+        let dir = tdir("hd-orch-tui-deny");
+        let mut r = fake(&dir, "t", WriteMode::Complete, "ok");
+        r.turn_end = Some(TURN_ENDED.into());
+        r.quits = true;
+        dispatch(&r, &default_config(), &claude_opts(&dir, "t")).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("t.settings.json")).unwrap()).unwrap();
+        let hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"].as_str().unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(hook).output().unwrap();
+        assert!(out.status.success());
+        let answer: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        assert_eq!(answer["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert!(answer["hookSpecificOutput"]["decision"]["message"].as_str().unwrap().contains("BLOCKED"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_codex_reviewer_runs_read_only_with_no_file_to_write() {
+        let dir = tdir("hd-orch-ro");
+        let mut r = fake(&dir, "t", WriteMode::Nothing, "");
+        r.final_message = Some("The bug is at calc.py:2".into());
+        r.exits = true;
+        let mut o = opts(&dir, "t");
+        o.vendor = Some("codex");
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        let commands = r.commands.borrow();
+        let c = script(&commands[0]);
+        assert!(c.contains("--sandbox read-only"), "was: {c}");
+        assert!(c.contains("--output-last-message"), "was: {c}");
+        let prompt = std::fs::read_to_string(protocol::prompt_path(&dir, "t")).unwrap();
+        assert!(prompt.contains("Review the diff."), "was: {prompt}");
+        assert!(!prompt.contains("DONE::"), "it can't write a file: {prompt}");
+        assert!(!prompt.contains(".result.md"), "it can't write a file: {prompt}");
+        assert_eq!(out.status, "done", "the saved answer is the result, with no marker to look for");
+        assert_eq!(out.result_text, "The bug is at calc.py:2");
+        assert_eq!(out.result_source, "file");
+        assert!(out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_read_only_reviewer_that_saved_nothing_has_failed() {
+        for saved in [None, Some("  \n")] {
+            let dir = tdir("hd-orch-ro-empty");
+            let mut r = fake(&dir, "t", WriteMode::Nothing, "");
+            r.final_message = saved.map(String::from);
+            r.exits = true;
+            let out = dispatch(&r, &default_config(), &opts(&dir, "t")).unwrap();
+            assert_eq!(out.status, "failed", "saved: {saved:?}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn a_codex_implementer_writes_its_result_file_from_the_workspace_sandbox() {
+        let dir = tdir("hd-orch-cx-impl");
+        let mut r = fake(&dir, "t", WriteMode::Complete, "ok");
+        r.exits = true;
+        let mut o = opts(&dir, "t");
+        o.role = "implementer";
+        o.vendor = Some("codex");
+        o.model = Some("x");
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        let commands = r.commands.borrow();
+        assert!(script(&commands[0]).contains("--sandbox workspace-write"), "was: {}", commands[0]);
+        assert!(std::fs::read_to_string(protocol::prompt_path(&dir, "t")).unwrap().contains("DONE::t"));
+        assert_eq!(out.status, "done");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1670,7 +1772,7 @@ mod tests {
         assert_eq!(fake.split_focus.borrow().as_slice(), [true]); // headed
         let commands = fake.commands.borrow();
         // launch (bare TUI, no `cat`/`tee`), then delivery line
-        assert!(commands[0].contains("codex --dangerously-bypass-approvals-and-sandbox"), "was: {}", commands[0]);
+        assert!(commands[0].ends_with("&& codex"), "was: {}", commands[0]);
         assert!(!commands[0].contains("| tee"), "launch should not tee: {}", commands[0]);
         assert!(commands.iter().any(|c| c.contains("follow all instructions")),
             "no delivery line in {commands:?}");
@@ -1830,6 +1932,7 @@ mod tests {
         std::fs::create_dir_all(&scratch_abs).unwrap();
         let r = fake(&scratch_abs, "rel-1", WriteMode::Complete, "ok");
         let mut o = opts(&rel_scratch, "rel-1");
+        o.vendor = Some("cursor");
         o.cwd = Some(rel_wt.to_str().unwrap());
         dispatch(&r, &default_config(), &o).unwrap();
         let cwd = r.split_cwd.borrow().clone().unwrap();
