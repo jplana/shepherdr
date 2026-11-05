@@ -7,28 +7,24 @@ pub struct PluginContext {
     pub worktree_path: Option<String>,
 }
 
-fn get_str(v: &Value, path: &[&str]) -> Option<String> {
-    let mut cur = v;
-    for key in path {
-        cur = cur.get(key)?;
-    }
-    cur.as_str().map(String::from)
-}
-
 pub fn parse_context(json: &str) -> PluginContext {
     let v: Value = serde_json::from_str(json).unwrap_or(Value::Null);
+    let text = |key: &str| v.get(key).and_then(Value::as_str).map(String::from);
     PluginContext {
-        workspace_id: get_str(&v, &["workspace", "workspace_id"]),
-        pane_id: get_str(&v, &["focused_pane", "pane_id"]),
-        worktree_path: get_str(&v, &["worktree", "path"]),
+        workspace_id: text("workspace_id"),
+        pane_id: text("focused_pane_id"),
+        // herdr reports the directory the focused pane's shell is in, which isn't
+        // always the worktree its agent is working in.
+        worktree_path: text("focused_pane_cwd"),
     }
 }
 
 pub fn second_opinion_context(ctx: &PluginContext) -> String {
     let path = ctx.worktree_path.as_deref().unwrap_or(".");
+    let quoted = crate::protocol::shell_quote(path);
     format!(
         "You are a second reviewer. Review the current git diff in the repository \
-at `{path}` (run `git -C {path} diff`). Report correctness bugs, risks, and \
+at `{path}` (run `git -C {quoted} diff`). Report correctness bugs, risks, and \
 unstated assumptions. Be concise and reference file:line.",
     )
 }
@@ -55,14 +51,17 @@ pub fn second_opinion_args(ctx: &PluginContext, scratch: &str, context_file: &st
 mod tests {
     use super::*;
 
+    /// What herdr 0.9.1 really sets in HERDR_PLUGIN_CONTEXT_JSON, captured from a plugin.
+    const REAL_CONTEXT: &str = r#"{"workspace_id":"wB","workspace_label":"sheperd-enhance",
+        "workspace_cwd":"/Users/jplana","tab_id":"wB:t1","tab_label":"1","focused_pane_id":"wB:p1",
+        "focused_pane_cwd":"/repo/wt","focused_pane_status":"unknown","invocation_source":"cli",
+        "correlation_id":"cli:plugin"}"#;
+
     #[test]
-    fn parses_present_fields() {
-        let j = r#"{"workspace":{"workspace_id":"1"},
-                    "focused_pane":{"pane_id":"1-2"},
-                    "worktree":{"path":"/repo/wt"}}"#;
-        let c = parse_context(j);
-        assert_eq!(c.workspace_id.as_deref(), Some("1"));
-        assert_eq!(c.pane_id.as_deref(), Some("1-2"));
+    fn parses_the_context_herdr_really_sends() {
+        let c = parse_context(REAL_CONTEXT);
+        assert_eq!(c.workspace_id.as_deref(), Some("wB"));
+        assert_eq!(c.pane_id.as_deref(), Some("wB:p1"));
         assert_eq!(c.worktree_path.as_deref(), Some("/repo/wt"));
     }
 
@@ -83,10 +82,10 @@ mod tests {
 
     #[test]
     fn second_opinion_stays_out_of_the_context_worktree() {
-        let ctx = parse_context(r#"{"focused_pane":{"pane_id":"1-2"},"worktree":{"path":"/repo/wt"}}"#);
+        let ctx = parse_context(REAL_CONTEXT);
         let args = second_opinion_args(&ctx, "/state", "/state/ctx.md");
         assert!(args.cwd.is_none(), "was: {:?}", args.cwd);
-        assert_eq!(args.from_pane, "1-2");
+        assert_eq!(args.from_pane, "wB:p1");
         assert_eq!(args.role, "reviewer");
         assert_eq!(args.context_file, "/state/ctx.md");
         assert_eq!(args.scratch, "/state");
@@ -98,6 +97,14 @@ mod tests {
         let args = second_opinion_args(&parse_context("{}"), "/state", "/state/ctx.md");
         assert!(args.cwd.is_none());
         assert_eq!(args.from_pane, "1-1");
+    }
+
+    #[test]
+    fn second_opinion_quotes_a_path_with_spaces() {
+        let c = PluginContext {
+            workspace_id: None, pane_id: None, worktree_path: Some("/my repo/wt".into()),
+        };
+        assert!(second_opinion_context(&c).contains("git -C '/my repo/wt' diff"));
     }
 
     #[test]

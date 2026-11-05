@@ -1,5 +1,8 @@
-use crate::state::{read_records, DispatchRecord};
+use crate::state::{newest, read_records, DispatchRecord};
 use std::path::Path;
+
+/// Every dispatch leaves a record, so the board shows only the latest ones.
+const BOARD_ROWS: usize = 20;
 
 pub fn render(records: &[DispatchRecord]) -> String {
     if records.is_empty() {
@@ -21,7 +24,7 @@ pub fn render(records: &[DispatchRecord]) -> String {
 
 pub fn run_board_loop(state_dir: &Path) -> ! {
     loop {
-        let records = read_records(state_dir).unwrap_or_default();
+        let records = newest(read_records(state_dir).unwrap_or_default(), BOARD_ROWS);
         print!("\x1b[2J\x1b[H{}", render(&records));
         use std::io::Write;
         std::io::stdout().flush().ok();
