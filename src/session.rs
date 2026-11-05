@@ -119,6 +119,17 @@ pub fn resume_command(vendor: &str, session_id: &str, cwd: &str) -> Result<Strin
     Ok(format!("cd {dir} && {resume}"))
 }
 
+/// A random (version 4) UUID, for handing a new agent session its ID up front.
+pub fn new_session_id() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

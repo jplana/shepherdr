@@ -6,11 +6,10 @@ Plugin id: `afogel.shepherdr`. macOS.
 
 ## What it does
 
-- **`dispatch`** (agent-initiated, called by the `dispatching-implementers-to-herdr` skill): splits a pane, runs a headless agent against a constructed prompt, and captures the agent's result. Completion is detected by **polling the result file** for a trailing sentinel marker (headless agents echo their prompt, so a scrollback sentinel is unreliable). The agent's combined output is teed to a durable `<task-id>.log`, from which the agent **session id** is parsed and stored so the run can be resumed later. The pane streams the agent's work for live/after-the-fact auditing and stays open when done.
+- **`dispatch`** (agent-initiated, called by the `dispatching-implementers-to-herdr` skill): opens a background tab, runs an agent against a constructed prompt, and captures its result. Completion is detected by **polling the result file** for a trailing sentinel marker. Claude runs in its **real interface**, with its usual colours and formatting, and you can type into it to take over. Its session id is chosen up front, and hooks report when each turn ends, so a turn that ends without a result or in an API error is reported as `failed` right away. Other vendors run headless, with their output teed to a durable `<task-id>.log` from which the session id is parsed. A clean finish closes the tab; any other outcome keeps it.
 - **`resume`** (CLI): reopens a finished dispatch's captured session in a fresh headed pane, in its original working directory — plain interactive, no autonomy flags. Fails closed if no session id was captured.
 - **`action second-opinion`** (keybinding-triggered, `prefix+r`): dispatches a codex review of the focused worktree's git diff. It runs codex with checks bypassed, in the directory the action was launched from, and reads the diff with `git -C`, which honors the reviewed repo's git config. Use it only on worktrees you trust.
 - **`action resume-last`** (keybinding-triggered, `prefix+shift+r`): reopens the newest resumable dispatch (latest completed dispatch with a captured session id) in a fresh headed pane, in its original working directory.
-- **`event worktree-created`**: auto-creates a `workers` tab.
 - **`board`**: an overlay pane rendering a live table of active dispatches from the plugin state dir, including a SESSION column so you can see at a glance which dispatches are resumable.
 
 ## Install
@@ -37,12 +36,12 @@ After pulling changes, run `cargo install --path .` again. Keep the clone in pla
 shepherdr dispatch \
   --role implementer|reviewer \
   --context-file <file>        # the constructed task/review context
-  --from-pane <pane-id>        # pane to split off (find via `herdr pane list`)
+  --from-pane <pane-id>        # the agent's tab opens in this pane's workspace, or this pane is split
   --task-id <id>               # names the prompt/result files and the sentinel
   --scratch <dir>              # where prompt/result files live
   [--vendor claude|codex|cursor]        # override the role's default
   [--unavailable codex,claude]          # skip vendors (e.g. out of tokens); falls back down the chain
-  [--reuse-pane <pane-id>]              # run in an existing pane instead of splitting (if it still exists)
+  [--reuse-pane <pane-id>]              # run in an existing pane instead (if it still exists)
   [--interactive]              # opt-in: start a HEADED TUI you drive from the
                                # start (bare TUI + gate-bypass flags, prompt
                                # delivered as one line, pane left live)
@@ -51,20 +50,22 @@ shepherdr dispatch \
   [--resume-session <id>]      # headless resume of a captured session; requires --vendor
   [--cwd <dir>]                # working directory for the agent (e.g. a worktree)
   [--timeout-ms N]             # poll deadline for the result file (default 600000)
-  [--split-direction right|down]
-  [--close]                    # dispose of the pane when done (default: keep open for auditing)
+  [--placement tab|split]      # a background tab of its own (default), or a split of --from-pane
+  [--split-direction right|down]        # with --placement split
+  [--keep-open]                # keep the tab or pane after a clean finish
+  [--headless]                 # run claude with -p instead of its real interface
   [--state-dir <dir>]          # write a DispatchRecord here for the board
 ```
 
 Prints JSON: `{status, task_id, vendor, pane_id, result_file, result_source, session_id, log_file, agent_exited, result_text}`.
-`session_id` is the captured agent session (null when none was found); it is what `resume` and `--resume-session` reuse.
-`log_file` is the durable `<task-id>.log` tee of the agent's output. `agent_exited` is true when the pane command left its `<task-id>.exited` marker or herdr reports the pane gone.
+`session_id` is the agent session, chosen up front for claude's real interface and otherwise captured from the log (null when none was found); it is what `resume` and `--resume-session` reuse.
+`log_file` is the durable `<task-id>.log` tee of a headless agent's output. For claude's real interface it is the session transcript, or a path that doesn't exist if no turn ended. `agent_exited` is true when the pane command left its `<task-id>.exited` marker or herdr reports the pane gone.
 `result_text` holds the agent's result on `done`. On `failed`, `timeout` and `degraded` it is bounded to the last 40 lines and at most 8 KiB, with a leading marker when the byte cap dropped text; the rest is in `log_file`.
-`status` is `done` (result file complete), `degraded` (partial file at timeout), `timeout` (no file; `result_text` carries the pane scrollback for diagnosis), or `failed` (the agent exited without a complete result).
+`status` is `done` (result file complete), `degraded` (partial file at timeout), `timeout` (no file; `result_text` carries the pane scrollback, which for the real interface may hold little), or `failed` (the agent exited, or its turn ended, without a complete result).
 
 Exit codes: `0` done, `3` degraded, `2` timeout or failed, `1` usage or herdr error.
 
-`--effort` is claude-only; other values and other vendors are rejected. Without it, a pane agent runs at claude's configured default effort, not the controller's. `--model` is required for headless `--role implementer`. `--resume-session` requires `--vendor`. `--model`, `--effort` and `--resume-session` are rejected with `--interactive`.
+`--effort` is claude-only; other values and other vendors are rejected. Without it, a pane agent runs at claude's configured default effort, not the controller's. `--model` is required for `--role implementer`, unless `--interactive`. `--resume-session` requires `--vendor`. `--model`, `--effort` and `--resume-session` are rejected with `--interactive`.
 
 ## Resuming a finished dispatch
 
@@ -88,13 +89,15 @@ Vendor selection is a preference chain, overridable per dispatch:
 
 | Role | Default chain | Command (autonomous) |
 |------|---------------|----------------------|
-| implementer | claude → cursor | `cat {prompt} \| claude -p --output-format stream-json --verbose --dangerously-skip-permissions` |
+| implementer | claude → cursor | `claude --session-id {session} --settings {settings} --dangerously-skip-permissions {first}`; with `--headless`, `cat {prompt} \| claude -p --output-format stream-json --verbose --dangerously-skip-permissions` |
 | reviewer | codex → cursor | `cat {prompt} \| codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust` |
 | (backup) | cursor | `cat {prompt} \| cursor-agent -p --output-format json --force` |
 
-The claude/cursor commands emit a structured JSON/NDJSON stream (rather than plain text) so the agent session id can be parsed from the run and stored on the dispatch record; codex prints it as a plain `session id:` line. That captured id is what `resume` / `resume-last` reopen.
+The headless claude and cursor commands emit a structured JSON/NDJSON stream (rather than plain text) so the agent session id can be parsed from the run and stored on the dispatch record; codex prints it as a plain `session id:` line. That captured id is what `resume` / `resume-last` reopen.
 
 Dispatched agents run with permission/sandbox bypass so they can actually do the work (run tools, write files). This is deliberate: an autonomous multi-agent harness needs its agents to act. Only run this on repos and tasks you're comfortable letting an agent operate on unattended.
+
+Claude's real interface stops at its trust prompt in a folder Claude has not been told to trust. In our testing, git worktrees of a trusted repo did not prompt. Run `claude` once in a new repo and answer the prompt, or use `--headless` if nobody will be there to answer it. A dispatch waiting at the prompt carries on once it is answered, and otherwise runs until its timeout.
 
 ### Interactive dispatch (opt-in)
 

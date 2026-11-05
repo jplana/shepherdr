@@ -17,8 +17,6 @@ enum Cmd {
     Resume(ResumeArgs),
     /// Human/keybinding-triggered action face.
     Action { name: String },
-    /// Event hook face (herdr event hooks).
-    Event { name: String },
     /// Workers board pane (declared in the manifest).
     Board,
 }
@@ -112,19 +110,6 @@ fn main() {
         }
         Cmd::Action { name } => {
             eprintln!("unknown action: {name}");
-            std::process::exit(1);
-        }
-        Cmd::Event { name } if name == "worktree-created" => {
-            let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
-            let runner = CliRunner::system();
-            match shepherdr::event::handle_worktree_created(&runner, &event_json) {
-                Ok(Some(tab)) => println!("created workers tab {tab}"),
-                Ok(None) => {}
-                Err(e) => { eprintln!("event error: {e}"); std::process::exit(1); }
-            }
-        }
-        Cmd::Event { name } => {
-            eprintln!("unknown event: {name}");
             std::process::exit(1);
         }
         Cmd::Board => {

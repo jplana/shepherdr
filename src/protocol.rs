@@ -20,6 +20,37 @@ pub fn exited_path(scratch: &Path, task_id: &str) -> PathBuf {
     scratch.join(format!("{task_id}.exited"))
 }
 
+pub fn settings_path(scratch: &Path, task_id: &str) -> PathBuf {
+    scratch.join(format!("{task_id}.settings.json"))
+}
+
+/// Written by the real interface's Stop hook each time a turn ends.
+pub fn turn_ended_path(scratch: &Path, task_id: &str) -> PathBuf {
+    scratch.join(format!("{task_id}.stop.json"))
+}
+
+/// Written by the real interface's StopFailure hook when a turn ends in an error.
+pub fn turn_failed_path(scratch: &Path, task_id: &str) -> PathBuf {
+    scratch.join(format!("{task_id}.stopfailure.json"))
+}
+
+/// Claude settings whose hooks save each hook's JSON input to the given files. The
+/// rename means a reader never sees half a file.
+pub fn hook_settings(turn_ended: &Path, turn_failed: &Path) -> String {
+    let save = |path: &Path| {
+        let target = shell_quote(&path.to_string_lossy());
+        let partial = shell_quote(&format!("{}.partial", path.to_string_lossy()));
+        serde_json::json!([{ "hooks": [{ "type": "command", "command": format!("cat > {partial} && mv {partial} {target}") }] }])
+    };
+    serde_json::json!({ "hooks": { "Stop": save(turn_ended), "StopFailure": save(turn_failed) } }).to_string()
+}
+
+/// What the real interface is told to do. The task itself stays in the prompt file,
+/// so the command line stays short.
+pub fn first_message(prompt_file: &Path) -> String {
+    format!("Read {} and follow all instructions in it.", prompt_file.display())
+}
+
 /// Last `n` lines of `text`; shorter input is returned whole.
 pub fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -56,21 +87,23 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// The command typed into a headless agent's pane. It runs under its own `sh`,
+/// The command typed into an agent's pane. `clear` removes the typed command from
+/// view. `log_file` is for headless agents only, because piping would stop the real
+/// interface from running in a terminal. It runs under its own `sh`,
 /// so whether the marker appears does not depend on how the pane's shell treats
 /// an interrupted command list. The EXIT trap leaves the marker once the pipeline
 /// has ended, however it ended, and also when `cd` fails. The signal traps turn a
 /// signal into a normal exit, because a shell killed by a signal may skip its EXIT
 /// trap. `sh` runs them only after the foreground pipeline has ended, so a marker
 /// always means the agent is gone. The marker path is passed as `$1`.
-pub fn pane_command(cd_to: Option<&str>, base: &str, log_file: &str, marker: &str) -> String {
+pub fn pane_command(cd_to: Option<&str>, base: &str, log_file: Option<&str>, marker: &str) -> String {
     let cd = cd_to.map_or(String::new(), |dir| format!("cd {} && ", shell_quote(dir)));
+    let logged = log_file.map_or(String::new(), |log| format!(" 2>&1 | tee {}", shell_quote(log)));
     let script = format!(
         "trap 'touch \"$1\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
-{cd}{base} 2>&1 | tee {}",
-        shell_quote(log_file),
+{cd}{base}{logged}",
     );
-    format!("sh -c {} sh {}", shell_quote(&script), shell_quote(marker))
+    format!("clear; sh -c {} sh {}", shell_quote(&script), shell_quote(marker))
 }
 
 pub fn build_prompt(context: &str, task_id: &str, result_file: &str, role: &str) -> String {
@@ -124,11 +157,6 @@ pub fn pane_id_from_split(json: &str) -> Result<String> {
         .as_str().ok_or_else(|| anyhow!("pane_id not a string"))?.to_string())
 }
 
-pub fn tab_id_from_create(json: &str) -> Result<String> {
-    let v: Value = serde_json::from_str(json)?;
-    Ok(field(&v, &["result", "tab", "tab_id"])?
-        .as_str().ok_or_else(|| anyhow!("tab_id not a string"))?.to_string())
-}
 
 #[derive(Debug)]
 pub enum Capture {
@@ -267,8 +295,8 @@ mod tests {
 
     #[test]
     fn pane_command_wraps_everything_in_sh_with_the_marker_as_an_argument() {
-        let out = pane_command(Some("/w t"), "cat '/p' | agent", "/l og", "/m k");
-        assert!(out.starts_with("sh -c '"), "was: {out}");
+        let out = pane_command(Some("/w t"), "cat '/p' | agent", Some("/l og"), "/m k");
+        assert!(out.starts_with("clear; sh -c '"), "was: {out}");
         assert!(out.ends_with(" sh '/m k'"), "was: {out}");
         for trap in [r#"touch "$1"'\'' EXIT"#, r"exit 129'\'' HUP", r"exit 130'\'' INT", r"exit 143'\'' TERM"] {
             assert!(out.contains(trap), "no {trap} in: {out}");
@@ -281,7 +309,7 @@ mod tests {
             let dir = pane_dir(name);
             let (log, marker) = (dir.join("t.log"), dir.join("t.exited"));
             let base = format!("printf x | sh -c {}", shell_quote(agent));
-            run_in_sh(&pane_command(None, &base, log.to_str().unwrap(), marker.to_str().unwrap()));
+            run_in_sh(&pane_command(None, &base, Some(log.to_str().unwrap()), marker.to_str().unwrap()));
             assert!(marker.exists(), "{name}: no marker");
             assert!(std::fs::read_to_string(&log).unwrap().contains("agent-output"), "{name}");
             std::fs::remove_dir_all(&dir).ok();
@@ -289,10 +317,21 @@ mod tests {
     }
 
     #[test]
+    fn pane_command_without_a_log_leaves_the_agent_on_the_terminal() {
+        let dir = pane_dir("no-log");
+        let marker = dir.join("t.exited");
+        let command = pane_command(None, "if [ -t 1 ]; then :; else echo piped; fi", None, marker.to_str().unwrap());
+        assert!(!command.contains("tee"), "was: {command}");
+        run_in_sh(&command);
+        assert!(marker.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn pane_command_runs_the_agent_in_the_given_directory() {
         let dir = pane_dir("cd");
         let (log, marker) = (dir.join("t.log"), dir.join("t.exited"));
-        run_in_sh(&pane_command(Some(dir.to_str().unwrap()), "pwd", log.to_str().unwrap(), marker.to_str().unwrap()));
+        run_in_sh(&pane_command(Some(dir.to_str().unwrap()), "pwd", Some(log.to_str().unwrap()), marker.to_str().unwrap()));
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(logged.trim_end().ends_with(dir.file_name().unwrap().to_str().unwrap()), "was: {logged}");
         std::fs::remove_dir_all(&dir).ok();
@@ -303,7 +342,7 @@ mod tests {
         let dir = pane_dir("cd-fail");
         let (log, marker, ran) = (dir.join("t.log"), dir.join("t.exited"), dir.join("ran"));
         let base = format!("touch {}", shell_quote(ran.to_str().unwrap()));
-        run_in_sh(&pane_command(Some("/definitely/not/here"), &base, log.to_str().unwrap(), marker.to_str().unwrap()));
+        run_in_sh(&pane_command(Some("/definitely/not/here"), &base, Some(log.to_str().unwrap()), marker.to_str().unwrap()));
         assert!(marker.exists());
         assert!(!ran.exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -381,12 +420,6 @@ mod capture_tests {
     fn pane_id_parsed() {
         let j = r#"{"result":{"pane":{"pane_id":"1-3"}}}"#;
         assert_eq!(pane_id_from_split(j).unwrap(), "1-3");
-    }
-
-    #[test]
-    fn tab_id_parsed() {
-        let j = r#"{"result":{"tab":{"tab_id":"1:2"}}}"#;
-        assert_eq!(tab_id_from_create(j).unwrap(), "1:2");
     }
 
     #[test]

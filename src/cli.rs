@@ -26,8 +26,16 @@ pub struct DispatchArgs {
     pub timeout_ms: u64,
     #[arg(long, default_value = "right")]
     pub split_direction: String,
+    /// Where the agent runs: a background tab of its own, or a split of --from-pane.
+    #[arg(long, default_value = "tab")]
+    pub placement: String,
+    /// Keep the tab or pane open after a clean finish.
     #[arg(long)]
-    pub close: bool,
+    pub keep_open: bool,
+    /// Run claude with -p instead of its real interface, such as in a repo Claude
+    /// has not been told to trust, where the real interface would stop at a prompt.
+    #[arg(long)]
+    pub headless: bool,
     #[arg(long)]
     pub state_dir: Option<String>,
     #[arg(long)]
@@ -61,7 +69,9 @@ pub fn run_dispatch<R: HerdrRunner>(args: &DispatchArgs, runner: &R) -> Result<D
         unavailable,
         timeout_ms: args.timeout_ms,
         split_direction: &args.split_direction,
-        close: args.close,
+        placement: &args.placement,
+        keep_open: args.keep_open,
+        headless: args.headless,
         state_dir,
         reuse_pane: args.reuse_pane.as_deref(),
         mode: if args.interactive { "interactive" } else { "headless" },
@@ -127,7 +137,7 @@ mod tests {
         fn wait_output(&self, _p: &str, _m: &str, _t: u64) -> anyhow::Result<bool> { Ok(true) }
         fn read(&self, _p: &str, _s: &str, _l: u32) -> anyhow::Result<String> { Ok("x".into()) }
         fn close(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        fn tab_create(&self, _w: &str, _l: &str) -> anyhow::Result<String> { Ok("{}".into()) }
+        fn open_tab(&self, _p: &str, _l: &str, _c: Option<&str>) -> anyhow::Result<String> { Ok("9-9".into()) }
         fn pane_exists(&self, _pane: &str) -> anyhow::Result<bool> { Ok(true) }
     }
 
@@ -150,7 +160,7 @@ mod tests {
         fn wait_output(&self, _p: &str, _m: &str, _t: u64) -> anyhow::Result<bool> { Ok(true) }
         fn read(&self, _p: &str, _s: &str, _l: u32) -> anyhow::Result<String> { Ok(String::new()) }
         fn close(&self, _p: &str) -> anyhow::Result<()> { Ok(()) }
-        fn tab_create(&self, _w: &str, _l: &str) -> anyhow::Result<String> { Ok("{}".into()) }
+        fn open_tab(&self, _p: &str, _l: &str, _c: Option<&str>) -> anyhow::Result<String> { Ok("9-9".into()) }
         fn pane_exists(&self, _p: &str) -> anyhow::Result<bool> { Ok(true) }
     }
 
@@ -213,7 +223,7 @@ mod tests {
             from_pane: "1-2".into(), task_id: "rev-1".into(),
             scratch: dir.to_string_lossy().into(), vendor: None, unavailable: String::new(),
             timeout_ms: 1000, split_direction: "right".into(),
-            close: false, state_dir: None, reuse_pane: None, interactive: false,
+            placement: "split".into(), keep_open: true, headless: false, state_dir: None, reuse_pane: None, interactive: false,
             model: None, effort: None, resume_session: None, cwd: None,
         };
         let out = run_dispatch(&args, &StubRunner { scratch: dir.clone(), task_id: "rev-1".into() }).unwrap();
