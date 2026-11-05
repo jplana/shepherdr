@@ -34,6 +34,14 @@ pub struct DispatchArgs {
     pub reuse_pane: Option<String>,
     #[arg(long)]
     pub interactive: bool,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub effort: Option<String>,
+    #[arg(long)]
+    pub resume_session: Option<String>,
+    #[arg(long)]
+    pub cwd: Option<String>,
 }
 
 pub fn run_dispatch<R: HerdrRunner>(args: &DispatchArgs, runner: &R) -> Result<DispatchResult> {
@@ -56,6 +64,10 @@ pub fn run_dispatch<R: HerdrRunner>(args: &DispatchArgs, runner: &R) -> Result<D
         reuse_pane: args.reuse_pane.as_deref(),
         mode: if args.interactive { "interactive" } else { "headless" },
         interactive: args.interactive,
+        model: args.model.as_deref(),
+        effort: args.effort.as_deref(),
+        resume_session: args.resume_session.as_deref(),
+        cwd: args.cwd.as_deref(),
     };
     dispatch(runner, &default_config(), &opts)
 }
@@ -83,7 +95,7 @@ pub fn run_resume<R: HerdrRunner>(args: &ResumeArgs, runner: &R) -> Result<Strin
     })?;
     let command = session::resume_command(&record.vendor, session_id, &record.cwd)?;
     let pane_id = protocol::pane_id_from_split(
-        &runner.split(&args.from_pane, &args.split_direction, true)?,
+        &runner.split(&args.from_pane, &args.split_direction, true, None)?,
     )?;
     runner.run(&pane_id, &command)?;
     Ok(pane_id)
@@ -96,7 +108,7 @@ mod tests {
 
     struct StubRunner { scratch: std::path::PathBuf, task_id: String }
     impl HerdrRunner for StubRunner {
-        fn split(&self, _p: &str, _d: &str, _f: bool) -> anyhow::Result<String> {
+        fn split(&self, _p: &str, _d: &str, _f: bool, _c: Option<&str>) -> anyhow::Result<String> {
             Ok(r#"{"result":{"pane":{"pane_id":"9-9"}}}"#.into())
         }
         fn run(&self, _p: &str, cmd: &str) -> anyhow::Result<()> {
@@ -123,7 +135,7 @@ mod tests {
         split_focus: RefCell<Vec<bool>>,
     }
     impl HerdrRunner for ResumeFake {
-        fn split(&self, _p: &str, _d: &str, focus: bool) -> anyhow::Result<String> {
+        fn split(&self, _p: &str, _d: &str, focus: bool, _c: Option<&str>) -> anyhow::Result<String> {
             self.split_focus.borrow_mut().push(focus);
             Ok(r#"{"result":{"pane":{"pane_id":"r-1"}}}"#.into())
         }
@@ -198,6 +210,7 @@ mod tests {
             scratch: dir.to_string_lossy().into(), vendor: None, unavailable: String::new(),
             timeout_ms: 1000, split_direction: "right".into(),
             close: false, state_dir: None, reuse_pane: None, interactive: false,
+            model: None, effort: None, resume_session: None, cwd: None,
         };
         let out = run_dispatch(&args, &StubRunner { scratch: dir.clone(), task_id: "rev-1".into() }).unwrap();
         assert_eq!(out.status, "done");

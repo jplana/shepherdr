@@ -3,7 +3,7 @@ use crate::protocol::{self, Capture};
 use crate::runner::HerdrRunner;
 use crate::state::{write_record, DispatchRecord};
 use crate::vendors::resolve;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -24,9 +24,13 @@ pub struct DispatchOpts<'a> {
     pub reuse_pane: Option<&'a str>,
     pub mode: &'a str,
     pub interactive: bool,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub resume_session: Option<&'a str>,
+    pub cwd: Option<&'a str>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct DispatchResult {
     pub status: String,
     pub task_id: String,
@@ -45,11 +49,10 @@ fn record(
     status: &str,
     created_at: &str,
     session_id: Option<&str>,
+    cwd: &str,
 ) {
     if let Some(dir) = opts.state_dir {
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let cwd = cwd.to_string();
         let _ = write_record(dir, &DispatchRecord {
             task_id: opts.task_id.into(), role: opts.role.into(),
             vendor: vendor.into(), pane_id: pane_id.into(), status: status.into(),
@@ -84,14 +87,56 @@ pub fn dispatch<R: HerdrRunner>(
     config: &Config,
     opts: &DispatchOpts,
 ) -> Result<DispatchResult> {
+    // All validation happens first, before any file write or herdr call.
+    if opts.interactive {
+        for (flag, given) in [
+            ("--model", opts.model.is_some()),
+            ("--effort", opts.effort.is_some()),
+            ("--resume-session", opts.resume_session.is_some()),
+        ] {
+            if given {
+                bail!("{flag} is not supported with --interactive");
+            }
+        }
+    }
+    if opts.resume_session.is_some() && opts.vendor.is_none() {
+        bail!("--resume-session requires an explicit --vendor");
+    }
+    if !opts.interactive && opts.role == "implementer" && opts.model.is_none() {
+        bail!("role implementer requires --model");
+    }
+    let cwd_path = match opts.cwd {
+        Some(c) => {
+            let abs = std::path::absolute(c)?;
+            if !abs.is_dir() {
+                bail!("--cwd {c} is not an existing directory");
+            }
+            abs
+        }
+        None => std::env::current_dir()?,
+    };
+    let cwd = cwd_path.to_string_lossy().into_owned();
+    let scratch = std::path::absolute(opts.scratch)?;
+
     let (vendor, spec) = resolve(opts.role, config, opts.vendor, &opts.unavailable)?;
     let vendor = vendor.to_string();
     let created_at = crate::state::now_created_at();
 
-    let prompt_file = protocol::prompt_path(opts.scratch, opts.task_id);
-    let result_file = protocol::result_path(opts.scratch, opts.task_id);
-    let log_file = protocol::log_path(opts.scratch, opts.task_id);
-    std::fs::create_dir_all(opts.scratch)?;
+    let prompt_file = protocol::prompt_path(&scratch, opts.task_id);
+    let result_file = protocol::result_path(&scratch, opts.task_id);
+    let log_file = protocol::log_path(&scratch, opts.task_id);
+    let base_command = if opts.interactive {
+        None
+    } else {
+        Some(crate::config::headless_command(
+            spec,
+            &prompt_file.to_string_lossy(),
+            opts.model,
+            opts.effort,
+            opts.resume_session,
+        )?)
+    };
+    std::fs::create_dir_all(&scratch)?;
     // A prior run/retry with the same task_id (e.g. a fallback vendor after
     // --unavailable) may have left a result file behind. Clear it so this
     // dispatch can only ever capture a file the current agent writes;
@@ -103,18 +148,22 @@ pub fn dispatch<R: HerdrRunner>(
     let _ = std::fs::remove_file(&log_file);
     std::fs::write(
         &prompt_file,
-        protocol::build_prompt(opts.context, opts.task_id, &result_file.to_string_lossy()),
+        protocol::build_prompt(opts.context, opts.task_id, &result_file.to_string_lossy(), opts.role),
     )?;
-    record(opts, &vendor, "", "dispatched", &created_at, None);
+    record(opts, &vendor, "", "dispatched", &created_at, None, &cwd);
 
-    if opts.interactive {
-        return dispatch_interactive(runner, spec, opts, &vendor, &prompt_file, &result_file, &created_at);
-    }
+    let Some(base) = base_command else {
+        return dispatch_interactive(runner, spec, opts, &vendor, &prompt_file, &result_file, &created_at, &cwd);
+    };
 
+    let mut reused = false;
     let pane_id = match opts.reuse_pane {
-        Some(p) if runner.pane_exists(p)? => p.to_string(),
+        Some(p) if runner.pane_exists(p)? => {
+            reused = true;
+            p.to_string()
+        }
         _ => protocol::pane_id_from_split(
-                 &runner.split(opts.from_pane, opts.split_direction, false)?,
+                 &runner.split(opts.from_pane, opts.split_direction, false, Some(&cwd))?,
              )?,
     };
 
@@ -124,7 +173,7 @@ pub fn dispatch<R: HerdrRunner>(
         result_source: source.into(), result_text: text, session_id: None,
     };
 
-    record(opts, &vendor, &pane_id, "working", &created_at, None);
+    record(opts, &vendor, &pane_id, "working", &created_at, None, &cwd);
 
     // Run the headless agent command; it writes its complete result to
     // result_file, whose last line becomes the sentinel marker. Prompt echo
@@ -132,8 +181,12 @@ pub fn dispatch<R: HerdrRunner>(
     // completion is detected by polling the result file itself rather than
     // watching the pane.
     let quoted_log = protocol::shell_quote(&log_file.to_string_lossy());
-    let base = crate::config::headless_command(spec, &prompt_file.to_string_lossy(), None, None, None)?;
-    let command = format!("{base} 2>&1 | tee {quoted_log}");
+    let cd = if reused {
+        format!("cd {} && ", protocol::shell_quote(&cwd))
+    } else {
+        String::new()
+    };
+    let command = format!("{cd}{base} 2>&1 | tee {quoted_log}");
     runner.run(&pane_id, &command)?;
 
     let completed = poll_result_file(&result_file, opts.task_id, opts.timeout_ms);
@@ -153,7 +206,7 @@ pub fn dispatch<R: HerdrRunner>(
         .ok()
         .and_then(|log| crate::session::extract_session_id(&vendor, &log));
     result.session_id = session_id.clone();
-    record(opts, &vendor, &pane_id, &result.status, &created_at, session_id.as_deref());
+    record(opts, &vendor, &pane_id, &result.status, &created_at, session_id.as_deref(), &cwd);
 
     if opts.close {
         runner.close(&pane_id)?;
@@ -177,14 +230,12 @@ fn dispatch_interactive<R: HerdrRunner>(
     prompt_file: &Path,
     result_file: &Path,
     created_at: &str,
+    cwd: &str,
 ) -> Result<DispatchResult> {
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let pane_id = protocol::pane_id_from_split(
-        &runner.split(opts.from_pane, opts.split_direction, true)?,
+        &runner.split(opts.from_pane, opts.split_direction, true, None)?,
     )?;
-    record(opts, vendor, &pane_id, "working", created_at, None);
+    record(opts, vendor, &pane_id, "working", created_at, None, cwd);
 
     let mk = |status: &str, source: &str, text: String| DispatchResult {
         status: status.into(), task_id: opts.task_id.into(), vendor: vendor.into(),
@@ -193,7 +244,7 @@ fn dispatch_interactive<R: HerdrRunner>(
     };
 
     // 1. Launch the bare TUI in the target dir with gate-bypass flags.
-    let launch = format!("cd {} && {}", protocol::shell_quote(&cwd), spec.interactive_command);
+    let launch = format!("cd {} && {}", protocol::shell_quote(cwd), spec.interactive_command);
     runner.run(&pane_id, &launch)?;
 
     // 2. Poll `read --source visible` for readiness (cue if set, else any
@@ -235,7 +286,7 @@ fn dispatch_interactive<R: HerdrRunner>(
             "interactive",
             "interactive TUI never showed a ready cue and delivery could not be verified".into(),
         );
-        record(opts, vendor, &pane_id, &result.status, created_at, None);
+        record(opts, vendor, &pane_id, &result.status, created_at, None, cwd);
         return Ok(result); // leave the pane live for manual inspection
     }
 
@@ -249,7 +300,7 @@ fn dispatch_interactive<R: HerdrRunner>(
         ),
     };
     // 6. Leave the pane live (never close): you continue interactively.
-    record(opts, vendor, &pane_id, &result.status, created_at, None);
+    record(opts, vendor, &pane_id, &result.status, created_at, None, cwd);
     Ok(result)
 }
 
@@ -280,11 +331,13 @@ mod tests {
         closed: RefCell<Vec<String>>,
         run_calls: RefCell<u32>,
         split_calls: RefCell<u32>,
+        split_cwd: RefCell<Option<String>>,
         pane_exists_result: bool,
         commands: RefCell<Vec<String>>,
     }
     impl HerdrRunner for FakeRunner {
-        fn split(&self, _p: &str, _d: &str, _f: bool) -> anyhow::Result<String> {
+        fn split(&self, _p: &str, _d: &str, _f: bool, cwd: Option<&str>) -> anyhow::Result<String> {
+            *self.split_cwd.borrow_mut() = cwd.map(String::from);
             *self.split_calls.borrow_mut() += 1;
             Ok(format!(r#"{{"result":{{"pane":{{"pane_id":"{}"}}}}}}"#, self.pane_id))
         }
@@ -336,6 +389,7 @@ mod tests {
             timeout_ms: 400, split_direction: "right",
             close: false, state_dir: None, reuse_pane: None, mode: "headless",
             interactive: false,
+            model: None, effort: None, resume_session: None, cwd: None,
         }
     }
 
@@ -346,7 +400,7 @@ mod tests {
             result_text: result_text.into(),
             scratch: scratch.to_path_buf(), task_id: task_id.into(),
             closed: RefCell::new(vec![]), run_calls: RefCell::new(0),
-            split_calls: RefCell::new(0), pane_exists_result: true,
+            split_calls: RefCell::new(0), split_cwd: RefCell::new(None), pane_exists_result: true,
             commands: RefCell::new(vec![]),
         }
     }
@@ -487,7 +541,7 @@ mod tests {
         split_focus: RefCell<Vec<bool>>,
     }
     impl HerdrRunner for InteractiveFake {
-        fn split(&self, _p: &str, _d: &str, focus: bool) -> anyhow::Result<String> {
+        fn split(&self, _p: &str, _d: &str, focus: bool, _c: Option<&str>) -> anyhow::Result<String> {
             self.split_focus.borrow_mut().push(focus);
             Ok(format!(r#"{{"result":{{"pane":{{"pane_id":"{}"}}}}}}"#, self.pane_id))
         }
@@ -553,6 +607,232 @@ mod tests {
         let prompt_file = protocol::prompt_path(&dir, "rev-quote");
         let quoted_prompt = format!("'{}'", prompt_file.to_string_lossy());
         assert!(commands[0].contains(&quoted_prompt));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn tdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn implementer_without_model_errors_before_any_herdr_call() {
+        let dir = tdir("hd-orch-nomodel");
+        let r = fake(&dir, "imp-1", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "imp-1");
+        o.role = "implementer";
+        let err = dispatch(&r, &default_config(), &o).unwrap_err().to_string();
+        assert!(err.contains("--model"), "was: {err}");
+        assert_eq!(*r.split_calls.borrow(), 0);
+        assert!(!dir.join("imp-1.prompt.md").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_without_vendor_errors() {
+        let dir = tdir("hd-orch-resume-novendor");
+        let r = fake(&dir, "res-1", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "res-1");
+        o.resume_session = Some("sess-1");
+        let err = dispatch(&r, &default_config(), &o).unwrap_err().to_string();
+        assert!(err.contains("--vendor"), "was: {err}");
+        assert_eq!(*r.split_calls.borrow(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cursor_resume_errors_before_any_pane() {
+        let dir = tdir("hd-orch-cursor-resume");
+        let r = fake(&dir, "cur-1", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "cur-1");
+        o.vendor = Some("cursor");
+        o.resume_session = Some("sess-1");
+        let err = dispatch(&r, &default_config(), &o).unwrap_err().to_string();
+        assert!(err.contains("cannot resume"), "was: {err}");
+        assert_eq!(*r.split_calls.borrow(), 0);
+        assert!(!dir.join("cur-1.prompt.md").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn interactive_with_model_effort_or_resume_errors() {
+        let dir = tdir("hd-orch-int-flags");
+        let r = fake(&dir, "int-1", WriteMode::Complete, "ok");
+        for flag in ["--model", "--effort", "--resume-session"] {
+            let mut o = opts(&dir, "int-1");
+            o.interactive = true;
+            o.vendor = Some("claude");
+            match flag {
+                "--model" => o.model = Some("opus"),
+                "--effort" => o.effort = Some("high"),
+                _ => o.resume_session = Some("s"),
+            }
+            let err = dispatch(&r, &default_config(), &o).unwrap_err().to_string();
+            assert!(err.contains(flag), "{flag}: {err}");
+        }
+        assert_eq!(*r.split_calls.borrow(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_effort_errors_before_any_pane() {
+        let dir = tdir("hd-orch-bad-effort");
+        let r = fake(&dir, "eff-1", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "eff-1");
+        o.vendor = Some("claude");
+        o.effort = Some("bogus");
+        let err = dispatch(&r, &default_config(), &o).unwrap_err().to_string();
+        assert!(err.contains("valid levels"), "was: {err}");
+        assert_eq!(*r.split_calls.borrow(), 0);
+        assert!(!dir.join("eff-1.prompt.md").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn effort_with_defaulted_codex_vendor_errors_before_any_pane() {
+        let dir = tdir("hd-orch-codex-effort");
+        let r = fake(&dir, "eff-2", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "eff-2");
+        o.effort = Some("high");
+        let err = dispatch(&r, &default_config(), &o).unwrap_err().to_string();
+        assert!(err.contains("--effort"), "was: {err}");
+        assert_eq!(*r.split_calls.borrow(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn effort_reaches_the_run_command() {
+        let dir = tdir("hd-orch-effort-ok");
+        let r = fake(&dir, "eff-3", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "eff-3");
+        o.role = "implementer";
+        o.model = Some("opus");
+        o.effort = Some("high");
+        dispatch(&r, &default_config(), &o).unwrap();
+        let commands = r.commands.borrow();
+        assert!(commands[0].contains("--effort 'high'"), "was: {}", commands[0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_cwd_errors_before_any_pane() {
+        let dir = tdir("hd-orch-nocwd");
+        let r = fake(&dir, "cwd-1", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "cwd-1");
+        o.cwd = Some("/definitely/not/here");
+        let err = dispatch(&r, &default_config(), &o).unwrap_err().to_string();
+        assert!(err.contains("/definitely/not/here"), "was: {err}");
+        assert_eq!(*r.split_calls.borrow(), 0);
+        assert!(!dir.join("cwd-1.prompt.md").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn relative_cwd_and_scratch_become_absolute() {
+        let base = tdir("hd-orch-rel");
+        std::fs::create_dir_all(base.join("wt")).unwrap();
+        // express both as paths relative to the process directory
+        let proc_dir = std::env::current_dir().unwrap();
+        let rel = |p: std::path::PathBuf| {
+            let mut out = std::path::PathBuf::new();
+            for _ in proc_dir.components().skip(1) { out.push(".."); }
+            out.join(p.strip_prefix("/").unwrap())
+        };
+        let rel_wt = rel(base.join("wt"));
+        let rel_scratch = rel(base.join("scratch"));
+        let scratch_abs = base.join("scratch");
+        std::fs::create_dir_all(&scratch_abs).unwrap();
+        let r = fake(&scratch_abs, "rel-1", WriteMode::Complete, "ok");
+        let mut o = opts(&rel_scratch, "rel-1");
+        o.cwd = Some(rel_wt.to_str().unwrap());
+        dispatch(&r, &default_config(), &o).unwrap();
+        let cwd = r.split_cwd.borrow().clone().unwrap();
+        assert!(std::path::Path::new(&cwd).is_absolute(), "was: {cwd}");
+        let commands = r.commands.borrow();
+        let prompt_arg = commands[0].split('\'').nth(1).unwrap();
+        assert!(std::path::Path::new(prompt_arg).is_absolute(), "was: {prompt_arg}");
+        let prompt = std::fs::read_to_string(scratch_abs.join("rel-1.prompt.md")).unwrap();
+        let result_line = prompt.lines().find(|l| l.contains("rel-1.result.md")).unwrap();
+        assert!(result_line.contains("`/"), "was: {result_line}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn cwd_defaults_to_process_directory_for_a_new_pane() {
+        let dir = tdir("hd-orch-cwd-default");
+        let r = fake(&dir, "cwd-2", WriteMode::Complete, "ok");
+        dispatch(&r, &default_config(), &opts(&dir, "cwd-2")).unwrap();
+        let expected = std::env::current_dir().unwrap().to_string_lossy().into_owned();
+        assert_eq!(r.split_cwd.borrow().as_deref(), Some(expected.as_str()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reused_pane_cds_to_cwd_first() {
+        let dir = tdir("hd-orch-reuse-cd");
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let r = fake(&dir, "cwd-3", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "cwd-3");
+        o.reuse_pane = Some("w1:p9");
+        o.cwd = Some(wt.to_str().unwrap());
+        dispatch(&r, &default_config(), &o).unwrap();
+        let commands = r.commands.borrow();
+        let prefix = format!("cd '{}' && ", wt.to_string_lossy());
+        assert!(commands[0].starts_with(&prefix), "was: {}", commands[0]);
+        assert_eq!(*r.split_calls.borrow(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_runs_resume_command_with_model() {
+        let dir = tdir("hd-orch-resume-cmd");
+        let r = fake(&dir, "res-2", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "res-2");
+        o.role = "implementer";
+        o.vendor = Some("claude");
+        o.model = Some("opus");
+        o.resume_session = Some("sess-1");
+        dispatch(&r, &default_config(), &o).unwrap();
+        let commands = r.commands.borrow();
+        assert!(commands[0].contains("claude -p --resume 'sess-1'"), "was: {}", commands[0]);
+        assert!(commands[0].contains("--model 'opus'"), "was: {}", commands[0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_with_closed_reuse_pane_splits_new_pane_in_cwd() {
+        let dir = tdir("hd-orch-resume-closed");
+        let mut r = fake(&dir, "res-3", WriteMode::Complete, "ok");
+        r.pane_exists_result = false;
+        let mut o = opts(&dir, "res-3");
+        o.role = "implementer";
+        o.vendor = Some("claude");
+        o.model = Some("opus");
+        o.resume_session = Some("sess-1");
+        o.reuse_pane = Some("w1:p9");
+        dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(*r.split_calls.borrow(), 1);
+        assert!(r.split_cwd.borrow().is_some());
+        assert!(r.commands.borrow()[0].contains("--resume"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn record_stores_given_cwd() {
+        let dir = tdir("hd-orch-record-cwd");
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let state = dir.join("state");
+        let r = fake(&dir, "rec-1", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "rec-1");
+        o.cwd = Some(wt.to_str().unwrap());
+        o.state_dir = Some(&state);
+        dispatch(&r, &default_config(), &o).unwrap();
+        let rec = crate::state::read_record(&state, "rec-1").unwrap().unwrap();
+        assert_eq!(rec.cwd, wt.to_string_lossy());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

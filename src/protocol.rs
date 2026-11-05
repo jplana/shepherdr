@@ -21,10 +21,16 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-pub fn build_prompt(context: &str, task_id: &str, result_file: &str) -> String {
+pub fn build_prompt(context: &str, task_id: &str, result_file: &str, role: &str) -> String {
+    let implementer = role == "implementer";
+    let (head, what) = if implementer {
+        ("You are a subagent dispatched to execute one specific task.\n\n", "the message you would report back")
+    } else {
+        ("", "your complete result")
+    };
     format!(
-        "{context}\n\n---\nWhen you have finished the task above, write your \
-complete result to the file `{result_file}` (overwrite it if it exists). The \
+        "{head}{context}\n\n---\nWhen you have finished the task above, write {what} \
+to the file `{result_file}` (overwrite it if it exists). The \
 very last line of that file must be exactly:\n\n{sentinel}",
         context = context.trim_end(),
         sentinel = sentinel(task_id),
@@ -113,8 +119,27 @@ mod tests {
     }
 
     #[test]
+    fn implementer_prompt_starts_with_subagent_line_and_asks_for_report_back() {
+        let out = build_prompt("Do it.", "t1", "/s/t1.result.md", "implementer");
+        assert_eq!(
+            out.lines().next().unwrap(),
+            "You are a subagent dispatched to execute one specific task."
+        );
+        assert!(out.contains("write the message you would report back to the file `/s/t1.result.md`"), "was: {out}");
+        assert!(!out.contains("complete result"), "was: {out}");
+        assert!(out.ends_with("DONE::t1"));
+    }
+
+    #[test]
+    fn reviewer_prompt_has_no_subagent_line_and_keeps_complete_result() {
+        let out = build_prompt("Do it.", "t1", "/s/t1.result.md", "reviewer");
+        assert!(!out.contains("subagent"), "was: {out}");
+        assert!(out.starts_with("Do it.\n\n---\nWhen you have finished the task above, write your complete result to the file `/s/t1.result.md`"), "was: {out}");
+    }
+
+    #[test]
     fn build_prompt_mentions_result_file_and_last_line_marker() {
-        let out = build_prompt("Do it.", "t1", "/s/t1.result.md");
+        let out = build_prompt("Do it.", "t1", "/s/t1.result.md", "reviewer");
         assert!(out.starts_with("Do it."));
         assert!(out.contains("/s/t1.result.md"));
         assert!(out.contains("DONE::t1"));

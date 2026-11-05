@@ -37,7 +37,7 @@ impl CommandExec for SystemExec {
 }
 
 pub trait HerdrRunner {
-    fn split(&self, pane: &str, direction: &str, focus: bool) -> Result<String>;
+    fn split(&self, pane: &str, direction: &str, focus: bool, cwd: Option<&str>) -> Result<String>;
     fn run(&self, pane: &str, command: &str) -> Result<()>;
     fn wait_output(&self, pane: &str, matcher: &str, timeout_ms: u64) -> Result<bool>;
     fn read(&self, pane: &str, source: &str, lines: u32) -> Result<String>;
@@ -59,9 +59,10 @@ impl CliRunner<SystemExec> {
 fn s(v: &str) -> String { v.to_string() }
 
 impl<E: CommandExec> HerdrRunner for CliRunner<E> {
-    fn split(&self, pane: &str, direction: &str, focus: bool) -> Result<String> {
+    fn split(&self, pane: &str, direction: &str, focus: bool, cwd: Option<&str>) -> Result<String> {
         let mut args = vec![s("pane"), s("split"), s(pane), s("--direction"), s(direction)];
         if !focus { args.push(s("--no-focus")); }
+        if let Some(dir) = cwd { args.push(s("--cwd")); args.push(s(dir)); }
         Ok(self.exec.exec(&args, true)?.stdout)
     }
     fn run(&self, pane: &str, command: &str) -> Result<()> {
@@ -124,11 +125,19 @@ mod tests {
     #[test]
     fn split_emits_no_focus_by_default() {
         let r = CliRunner::new(rec(r#"{"result":{"pane":{"pane_id":"1-3"}}}"#, 0));
-        let out = r.split("1-2", "right", false).unwrap();
+        let out = r.split("1-2", "right", false, None).unwrap();
         assert!(out.contains("1-3"));
         let call = &r.exec.calls.borrow()[0];
         assert_eq!(call.0, vec!["pane","split","1-2","--direction","right","--no-focus"]);
         assert!(call.1); // captured
+    }
+
+    #[test]
+    fn split_passes_cwd_when_given() {
+        let r = CliRunner::new(rec(r#"{"result":{"pane":{"pane_id":"1-3"}}}"#, 0));
+        r.split("1-2", "right", false, Some("/wt")).unwrap();
+        let call = &r.exec.calls.borrow()[0];
+        assert_eq!(call.0, vec!["pane","split","1-2","--direction","right","--no-focus","--cwd","/wt"]);
     }
 
     #[test]

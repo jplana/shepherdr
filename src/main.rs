@@ -79,6 +79,7 @@ fn main() {
                 vendor: None, unavailable: String::new(), timeout_ms: 600_000,
                 split_direction: "right".into(), close: false,
                 state_dir: Some(scratch), reuse_pane: None, interactive: false,
+                model: None, effort: None, resume_session: None, cwd: None,
             };
             let runner = CliRunner::system();
             match run_dispatch(&args, &runner) {
