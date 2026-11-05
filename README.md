@@ -6,7 +6,7 @@ Plugin id: `afogel.shepherdr`. macOS.
 
 ## What it does
 
-- **`dispatch`** (agent-initiated, called by the `dispatching-implementers-to-herdr` skill): splits a pane, runs a headless agent against a constructed prompt, and captures the agent's result. Completion is detected by **polling the result file** for a trailing sentinel marker (headless agents echo their prompt, so a scrollback sentinel is unreliable). The agent's combined output is teed to a durable `<task-id>.log`, from which the agent **session id** is parsed and stored so the run can be resumed later. The pane streams the agent's work for live/after-the-fact auditing and stays open when done.
+- **`dispatch`** (agent-initiated, called by the `dispatching-implementers-to-herdr` skill): splits a pane, runs a headless agent against a constructed prompt, and captures the agent's result. Completion is detected by **polling the result file** for a trailing sentinel marker (headless agents echo their prompt, so a scrollback sentinel is unreliable). The agent's combined output is teed to a durable `<task-id>.log`, from which the agent **session id** is parsed and stored so the run can be resumed later. The pane shows the agent's work for live and after-the-fact auditing and stays open when done. For claude, the pane shows its messages, one line per tool call and any tool errors, while the log keeps the raw JSON stream.
 - **`resume`** (CLI): reopens a finished dispatch's captured session in a fresh headed pane, in its original working directory — plain interactive, no autonomy flags. Fails closed if no session id was captured.
 - **`action second-opinion`** (keybinding-triggered, `prefix+r`): dispatches a codex review of the focused worktree's git diff. It runs codex with checks bypassed, in the directory the action was launched from, and reads the diff with `git -C`, which honors the reviewed repo's git config. Use it only on worktrees you trust.
 - **`action resume-last`** (keybinding-triggered, `prefix+shift+r`): reopens the newest resumable dispatch (latest completed dispatch with a captured session id) in a fresh headed pane, in its original working directory.
@@ -92,7 +92,7 @@ Vendor selection is a preference chain, overridable per dispatch:
 | reviewer | codex → cursor | `cat {prompt} \| codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust` |
 | (backup) | cursor | `cat {prompt} \| cursor-agent -p --output-format json --force` |
 
-The claude/cursor commands emit a structured JSON/NDJSON stream (rather than plain text) so the agent session id can be parsed from the run and stored on the dispatch record; codex prints it as a plain `session id:` line. That captured id is what `resume` / `resume-last` reopen.
+The claude/cursor commands emit a structured JSON/NDJSON stream (rather than plain text) so the agent session id can be parsed from the run and stored on the dispatch record. Dispatch formats claude's stream for the pane with a hidden `shepherdr render-stream` step, and the pane falls back to the raw stream if that step fails. Cursor's output is shown raw; codex prints it as a plain `session id:` line. That captured id is what `resume` / `resume-last` reopen.
 
 Dispatched agents run with permission/sandbox bypass so they can actually do the work (run tools, write files). This is deliberate: an autonomous multi-agent harness needs its agents to act. Only run this on repos and tasks you're comfortable letting an agent operate on unattended.
 

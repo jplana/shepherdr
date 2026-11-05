@@ -21,6 +21,9 @@ enum Cmd {
     Event { name: String },
     /// Workers board pane (declared in the manifest).
     Board,
+    /// Formats claude's stream-json for a pane; part of the pane command.
+    #[command(hide = true)]
+    RenderStream,
 }
 
 fn status_exit_code(status: &str) -> i32 {
@@ -58,6 +61,7 @@ fn main() {
                 }
             }
         }
+        Cmd::RenderStream => shepherdr::render::run(std::io::stdin().lock(), std::io::stdout().lock()),
         Cmd::Action { name } if name == "noop" => println!("ok"),
         Cmd::Action { name } if name == "second-opinion" => {
             let ctx_json = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();

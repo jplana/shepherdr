@@ -7,6 +7,7 @@ pub mod config;
 pub mod event;
 pub mod orchestrate;
 pub mod protocol;
+pub mod render;
 pub mod runner;
 pub mod session;
 pub mod state;

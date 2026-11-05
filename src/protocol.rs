@@ -63,11 +63,22 @@ pub(crate) fn shell_quote(value: &str) -> String {
 /// signal into a normal exit, because a shell killed by a signal may skip its EXIT
 /// trap. `sh` runs them only after the foreground pipeline has ended, so a marker
 /// always means the agent is gone. The marker path is passed as `$1`.
-pub fn pane_command(cd_to: Option<&str>, base: &str, log_file: &str, marker: &str) -> String {
+///
+/// The log always gets the agent's raw output. `display`, when given, decides what
+/// the pane shows instead. If it fails the pane falls back to the raw output, because
+/// a display that stopped reading would break the pipe and kill the agent.
+pub fn pane_command(
+    cd_to: Option<&str>,
+    base: &str,
+    log_file: &str,
+    marker: &str,
+    display: Option<&str>,
+) -> String {
     let cd = cd_to.map_or(String::new(), |dir| format!("cd {} && ", shell_quote(dir)));
+    let shown = display.map_or(String::new(), |d| format!(" | {{ {d} || cat; }}"));
     let script = format!(
         "trap 'touch \"$1\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
-{cd}{base} 2>&1 | tee {}",
+{cd}{base} 2>&1 | tee {}{shown}",
         shell_quote(log_file),
     );
     format!("sh -c {} sh {}", shell_quote(&script), shell_quote(marker))
@@ -267,7 +278,7 @@ mod tests {
 
     #[test]
     fn pane_command_wraps_everything_in_sh_with_the_marker_as_an_argument() {
-        let out = pane_command(Some("/w t"), "cat '/p' | agent", "/l og", "/m k");
+        let out = pane_command(Some("/w t"), "cat '/p' | agent", "/l og", "/m k", None);
         assert!(out.starts_with("sh -c '"), "was: {out}");
         assert!(out.ends_with(" sh '/m k'"), "was: {out}");
         for trap in [r#"touch "$1"'\'' EXIT"#, r"exit 129'\'' HUP", r"exit 130'\'' INT", r"exit 143'\'' TERM"] {
@@ -281,7 +292,7 @@ mod tests {
             let dir = pane_dir(name);
             let (log, marker) = (dir.join("t.log"), dir.join("t.exited"));
             let base = format!("printf x | sh -c {}", shell_quote(agent));
-            run_in_sh(&pane_command(None, &base, log.to_str().unwrap(), marker.to_str().unwrap()));
+            run_in_sh(&pane_command(None, &base, log.to_str().unwrap(), marker.to_str().unwrap(), None));
             assert!(marker.exists(), "{name}: no marker");
             assert!(std::fs::read_to_string(&log).unwrap().contains("agent-output"), "{name}");
             std::fs::remove_dir_all(&dir).ok();
@@ -289,10 +300,36 @@ mod tests {
     }
 
     #[test]
+    fn pane_command_shows_the_display_but_logs_the_raw_output() {
+        let dir = pane_dir("display");
+        let (log, marker) = (dir.join("t.log"), dir.join("t.exited"));
+        let command = pane_command(None, "echo raw", log.to_str().unwrap(), marker.to_str().unwrap(), Some("tr a-z A-Z"));
+        let shown = std::process::Command::new("sh").arg("-c").arg(&command).output().unwrap().stdout;
+        assert_eq!(String::from_utf8_lossy(&shown), "RAW\n");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "raw\n");
+        assert!(marker.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_display_does_not_kill_the_agent() {
+        let dir = pane_dir("display-fail");
+        let (log, marker) = (dir.join("t.log"), dir.join("t.exited"));
+        // More output than a pipe holds, written after the display has already died.
+        let base = "sleep 0.3; seq 1 50000; echo agent-finished";
+        let command = pane_command(None, &format!("sh -c {}", shell_quote(base)), log.to_str().unwrap(), marker.to_str().unwrap(), Some("false"));
+        let shown = std::process::Command::new("sh").arg("-c").arg(&command).output().unwrap().stdout;
+        assert!(std::fs::read_to_string(&log).unwrap().ends_with("agent-finished\n"), "agent was cut off");
+        assert!(String::from_utf8_lossy(&shown).ends_with("agent-finished\n"), "pane lost the raw fallback");
+        assert!(marker.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn pane_command_runs_the_agent_in_the_given_directory() {
         let dir = pane_dir("cd");
         let (log, marker) = (dir.join("t.log"), dir.join("t.exited"));
-        run_in_sh(&pane_command(Some(dir.to_str().unwrap()), "pwd", log.to_str().unwrap(), marker.to_str().unwrap()));
+        run_in_sh(&pane_command(Some(dir.to_str().unwrap()), "pwd", log.to_str().unwrap(), marker.to_str().unwrap(), None));
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(logged.trim_end().ends_with(dir.file_name().unwrap().to_str().unwrap()), "was: {logged}");
         std::fs::remove_dir_all(&dir).ok();
@@ -303,7 +340,7 @@ mod tests {
         let dir = pane_dir("cd-fail");
         let (log, marker, ran) = (dir.join("t.log"), dir.join("t.exited"), dir.join("ran"));
         let base = format!("touch {}", shell_quote(ran.to_str().unwrap()));
-        run_in_sh(&pane_command(Some("/definitely/not/here"), &base, log.to_str().unwrap(), marker.to_str().unwrap()));
+        run_in_sh(&pane_command(Some("/definitely/not/here"), &base, log.to_str().unwrap(), marker.to_str().unwrap(), None));
         assert!(marker.exists());
         assert!(!ran.exists());
         std::fs::remove_dir_all(&dir).ok();

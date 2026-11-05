@@ -176,6 +176,16 @@ fn poll_headless<R: HerdrRunner>(
     }
 }
 
+/// A JSON stream gets formatted for the pane. Other output is already readable. This
+/// binary's own path is used because the pane's shell may not have it on PATH.
+fn display_filter(base: &str) -> Option<String> {
+    if !base.contains("--output-format stream-json") {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    Some(format!("{} render-stream", protocol::shell_quote(&exe.to_string_lossy())))
+}
+
 pub fn dispatch<R: HerdrRunner>(
     runner: &R,
     config: &Config,
@@ -283,6 +293,7 @@ pub fn dispatch<R: HerdrRunner>(
         &base,
         &log_file.to_string_lossy(),
         &exited_file.to_string_lossy(),
+        display_filter(&base).as_deref(),
     );
     // herdr may have delivered the command before it stopped answering.
     runner.run(&pane_id, &command).map_err(|e| {
@@ -999,6 +1010,21 @@ mod tests {
         assert!(!out.agent_exited);
         assert!(*r.pane_exists_calls.borrow() >= 1, "polling never checked the pane");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_a_json_stream_gets_the_display_filter() {
+        for (vendor, filtered) in [("claude", true), ("codex", false)] {
+            let dir = tdir(&format!("hd-orch-display-{vendor}"));
+            let r = fake(&dir, "rev-df", WriteMode::Complete, "ok");
+            let mut o = opts(&dir, "rev-df");
+            o.vendor = Some(vendor);
+            dispatch(&r, &default_config(), &o).unwrap();
+            let commands = r.commands.borrow();
+            assert_eq!(commands[0].contains("render-stream"), filtered, "{vendor}: {}", commands[0]);
+            assert!(commands[0].contains("tee "), "{vendor}: {}", commands[0]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]
