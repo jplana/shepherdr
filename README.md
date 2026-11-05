@@ -15,24 +15,21 @@ Plugin id: `afogel.shepherdr`. macOS.
 
 ## Install
 
-Requires the Rust toolchain and `~/.cargo/bin` on `PATH` — the plugin builds a native binary on install.
+This is a fork of [afogel/shepherdr](https://github.com/afogel/shepherdr). Install it from a clone: `herdr plugin install afogel/shepherdr` installs the upstream code, which doesn't have the Superpowers 7 integration. The plugin id is still `afogel.shepherdr`.
 
-**From the marketplace (recommended):**
-
-```bash
-herdr plugin install afogel/shepherdr
-```
-
-herdr clones the repo and runs the manifest's build step (`cargo install --path .`), placing the `shepherdr` binary on `~/.cargo/bin`.
-
-**Local development (from a clone):**
+Requires the Rust toolchain.
 
 ```bash
-cd path/to/shepherdr
-cargo install --path .            # local `link` does not build, so build it yourself
+git clone https://github.com/jplana/shepherdr.git
+cd shepherdr
+cargo install --path .            # `link` does not build, so build it yourself
 herdr plugin link "$PWD"
 herdr plugin action list --plugin afogel.shepherdr   # sanity check
 ```
+
+herdr and your shell both run `shepherdr` by name. If `~/.cargo/bin` isn't on their `PATH`, symlink the binary into a directory that is, such as `ln -s ~/.cargo/bin/shepherdr ~/.local/bin/shepherdr`.
+
+After pulling changes, run `cargo install --path .` again. Keep the clone in place, because the plugin link points into it.
 
 ## The dispatch CLI
 
