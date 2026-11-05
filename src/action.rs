@@ -43,9 +43,10 @@ pub fn second_opinion_args(ctx: &PluginContext, scratch: &str, context_file: &st
         split_direction: "right".into(), close: false,
         state_dir: Some(scratch.into()), reuse_pane: None, interactive: false,
         model: None, effort: None, resume_session: None,
-        // None, not the worktree: codex runs with hook trust and the sandbox bypassed,
-        // so inside the reviewed worktree that worktree's own config could run. The
-        // prompt reaches the worktree through `git -C` instead.
+        // This sets no working directory: the pane starts in the launch directory.
+        // Passing the worktree path would add nothing safe. The action is not isolated
+        // from the reviewed repo, because `git -C` honors that repo's config. Isolation
+        // belongs to the sandboxing work.
         cwd: None,
     }
 }

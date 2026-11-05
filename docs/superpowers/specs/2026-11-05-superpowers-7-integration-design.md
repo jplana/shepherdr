@@ -130,9 +130,11 @@ description is triggering conditions only: when executing a plan with
   process's working directory. When a pane is reused, the command is prefixed
   with `cd <path> &&`. Today nothing sets this for headless runs, so an
   implementer could run outside the worktree. It is included because stock's
-  worktree isolation depends on it. The `second-opinion` action does not pass it:
-  it runs codex with checks bypassed outside the worktree and reads the diff
-  through `git -C`, so that the reviewed worktree's own config cannot run.
+  worktree isolation depends on it. The `second-opinion` action does not pass it,
+  so its pane starts in the directory the action was launched from. That action is
+  not isolated from the reviewed repo: it runs codex with checks bypassed and reads
+  the diff with `git -C`, which honors that repo's git config. Isolation belongs to
+  the sandboxing work.
 - **Exit detection for headless runs.** The pane command runs the agent pipeline
   under its own `sh -c`, with traps that create `<scratch>/<task-id>.exited` when
   that `sh` exits: on a normal or nonzero exit, on SIGINT, SIGTERM or SIGHUP, and
