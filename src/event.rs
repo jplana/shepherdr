@@ -28,7 +28,7 @@ mod tests {
 
     struct FakeRunner { calls: RefCell<Vec<(String, String)>> }
     impl HerdrRunner for FakeRunner {
-        fn split(&self, _p: &str, _d: &str, _f: bool) -> anyhow::Result<String> { Ok("{}".into()) }
+        fn split(&self, _p: &str, _d: &str, _f: bool, _c: Option<&str>) -> anyhow::Result<String> { Ok("{}".into()) }
         fn run(&self, _p: &str, _c: &str) -> anyhow::Result<()> { Ok(()) }
         fn wait_output(&self, _p: &str, _m: &str, _t: u64) -> anyhow::Result<bool> { Ok(true) }
         fn read(&self, _p: &str, _s: &str, _l: u32) -> anyhow::Result<String> { Ok(String::new()) }

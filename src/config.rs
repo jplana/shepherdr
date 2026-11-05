@@ -10,6 +10,65 @@ pub struct VendorSpec {
     /// this is the fragile per-vendor knob, tuned by the live `--interactive`
     /// smoke test.
     pub ready_cue: String,
+    /// Flag that carries the model, e.g. `--model`.
+    pub model_flag: String,
+    /// Flag that carries the effort level; `None` when the CLI has none.
+    pub effort_flag: Option<String>,
+    /// Headless resume template (`{session}`, `{model}`, `{effort}`,
+    /// `{prompt}`); `None` when the CLI cannot resume headlessly.
+    pub resume_command: Option<String>,
+}
+
+const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Name of the CLI a template invokes: the first word after the `cat {prompt} |` pipe.
+fn cli_name(spec: &VendorSpec) -> &str {
+    spec.command
+        .split_once("| ")
+        .map_or(spec.command.as_str(), |(_, rest)| rest)
+        .split_whitespace()
+        .next()
+        .unwrap_or("vendor")
+}
+
+/// Build the headless command line, shell-quoting every value.
+pub fn headless_command(
+    spec: &VendorSpec,
+    prompt_file: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    resume_session: Option<&str>,
+) -> anyhow::Result<String> {
+    use crate::protocol::shell_quote;
+    let cli = cli_name(spec);
+    if let Some(level) = effort {
+        if !EFFORT_LEVELS.contains(&level) {
+            anyhow::bail!(
+                "unknown effort {level:?}; valid levels: {}",
+                EFFORT_LEVELS.join(", ")
+            );
+        }
+        if spec.effort_flag.is_none() {
+            anyhow::bail!("{cli} does not support --effort");
+        }
+    }
+    let template = match resume_session {
+        Some(_) => spec
+            .resume_command
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("{cli} cannot resume a session headlessly"))?,
+        None => spec.command.as_str(),
+    };
+    let flag = |flag: &str, value: Option<&str>| {
+        value.map_or(String::new(), |v| format!(" {flag} {}", shell_quote(v)))
+    };
+    let model_part = flag(&spec.model_flag, model);
+    let effort_part = flag(spec.effort_flag.as_deref().unwrap_or(""), effort);
+    Ok(template
+        .replace("{model}", &model_part)
+        .replace("{effort}", &effort_part)
+        .replace("{session}", &shell_quote(resume_session.unwrap_or("")))
+        .replace("{prompt}", &shell_quote(prompt_file)))
 }
 
 pub struct Config {
@@ -17,8 +76,18 @@ pub struct Config {
     pub vendors: BTreeMap<String, VendorSpec>,
 }
 
-fn vendor(command: &str, interactive_command: &str, ready_cue: &str) -> VendorSpec {
+fn vendor(
+    command: &str,
+    interactive_command: &str,
+    ready_cue: &str,
+    model_flag: &str,
+    effort_flag: Option<&str>,
+    resume_command: Option<&str>,
+) -> VendorSpec {
     VendorSpec {
+        model_flag: model_flag.into(),
+        effort_flag: effort_flag.map(Into::into),
+        resume_command: resume_command.map(Into::into),
         command: command.into(),
         interactive_command: interactive_command.into(),
         ready_cue: ready_cue.into(),
@@ -34,25 +103,34 @@ pub fn default_config() -> Config {
     vendors.insert(
         "claude".into(),
         vendor(
-            "cat {prompt} | claude -p --output-format stream-json --verbose --dangerously-skip-permissions",
+            "cat {prompt} | claude -p{model}{effort} --output-format stream-json --verbose --dangerously-skip-permissions",
             "claude --dangerously-skip-permissions",
             "",
+            "--model",
+            Some("--effort"),
+            Some("cat {prompt} | claude -p --resume {session}{model}{effort} --output-format stream-json --verbose --dangerously-skip-permissions"),
         ),
     );
     vendors.insert(
         "codex".into(),
         vendor(
-            "cat {prompt} | codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
+            "cat {prompt} | codex exec{model} --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
             "codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
             "",
+            "-m",
+            None,
+            Some("cat {prompt} | codex exec resume --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust{model} {session} -"),
         ),
     );
     vendors.insert(
         "cursor".into(),
         vendor(
-            "cat {prompt} | cursor-agent -p --output-format json --force",
+            "cat {prompt} | cursor-agent -p{model} --output-format json --force",
             "cursor-agent --force",
             "",
+            "--model",
+            None,
+            None,
         ),
     );
 
@@ -118,5 +196,98 @@ mod tests {
         assert!(config.vendors["codex"].command.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(config.vendors["codex"].command.contains("--skip-git-repo-check"));
         assert!(config.vendors["cursor"].command.contains("--force"));
+    }
+
+    fn cfg(v: &str) -> VendorSpec {
+        let mut c = default_config();
+        c.vendors.remove(v).unwrap()
+    }
+
+    #[test]
+    fn new_session_without_model_has_no_flag_or_placeholder() {
+        let cmd = headless_command(&cfg("claude"), "/s/p.md", None, None, None).unwrap();
+        assert!(!cmd.contains("--model"));
+        assert!(!cmd.contains("{model}"));
+        assert!(!cmd.contains("{prompt}"));
+        assert!(cmd.contains("cat '/s/p.md' | claude -p"));
+    }
+
+    #[test]
+    fn model_uses_each_vendors_flag() {
+        let c = headless_command(&cfg("claude"), "/s/p.md", Some("opus"), None, None).unwrap();
+        assert!(c.contains("--model 'opus'"));
+        let c = headless_command(&cfg("codex"), "/s/p.md", Some("o3"), None, None).unwrap();
+        assert!(c.contains("-m 'o3'"));
+        let c = headless_command(&cfg("cursor"), "/s/p.md", Some("x"), None, None).unwrap();
+        assert!(c.contains("--model 'x'"));
+    }
+
+    #[test]
+    fn claude_resume_keeps_stream_json_and_flags() {
+        let c = headless_command(&cfg("claude"), "/s/p.md", None, None, Some("sess-1")).unwrap();
+        assert!(c.contains("claude -p --resume 'sess-1'"));
+        assert!(c.contains("--output-format stream-json"));
+        assert!(c.contains("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn codex_resume_reads_prompt_from_stdin() {
+        let c = headless_command(&cfg("codex"), "/s/p.md", None, None, Some("sess-1")).unwrap();
+        assert!(c.ends_with("'sess-1' -"));
+        assert!(c.contains("codex exec resume"));
+        for f in ["--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust"] {
+            assert!(c.contains(f));
+            assert!(cfg("codex").command.contains(f));
+        }
+    }
+
+    #[test]
+    fn cursor_resume_is_a_clear_error() {
+        let e = headless_command(&cfg("cursor"), "/s/p.md", None, None, Some("s")).unwrap_err().to_string();
+        assert!(e.contains("cursor") && e.contains("resume"));
+    }
+
+    #[test]
+    fn hostile_values_are_quoted() {
+        let c = headless_command(&cfg("claude"), "/s/p.md", Some("a b'c"), None, Some("a b'c")).unwrap();
+        assert!(c.contains("'a b'\\''c'"));
+        assert!(c.contains("--resume 'a b'\\''c'"));
+        assert!(c.contains("--model 'a b'\\''c'"));
+    }
+
+    #[test]
+    fn claude_effort_is_passed_on_new_and_resumed_sessions() {
+        let s = cfg("claude");
+        assert!(headless_command(&s, "/p", None, Some("high"), None).unwrap().contains("--effort 'high'"));
+        assert!(headless_command(&s, "/p", None, Some("high"), Some("s")).unwrap().contains("--effort 'high'"));
+        for r in [None, Some("s")] {
+            let c = headless_command(&s, "/p", None, None, r).unwrap();
+            assert!(!c.contains("--effort") && !c.contains("{effort}"));
+        }
+    }
+
+    #[test]
+    fn every_valid_effort_level_is_accepted() {
+        for l in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(headless_command(&cfg("claude"), "/p", None, Some(l), None).is_ok());
+        }
+    }
+
+    #[test]
+    fn unknown_effort_is_an_error_listing_levels() {
+        let e = headless_command(&cfg("claude"), "/p", None, Some("bogus"), None).unwrap_err().to_string();
+        assert!(e.contains("bogus") && e.contains("xhigh"));
+        assert!(headless_command(&cfg("claude"), "/p", None, Some("HIGH"), None).is_err());
+        assert!(headless_command(&cfg("claude"), "/p", None, Some(""), None).is_err());
+    }
+
+    #[test]
+    fn effort_on_codex_or_cursor_is_a_clear_error() {
+        for v in ["codex", "cursor"] {
+            let s = cfg(v);
+            let e = headless_command(&s, "/p", None, Some("high"), None).unwrap_err().to_string();
+            assert!(e.contains(v) && e.contains("--effort"));
+            assert!(!headless_command(&s, "/p", None, None, None).unwrap().contains("{effort}"));
+        }
     }
 }
