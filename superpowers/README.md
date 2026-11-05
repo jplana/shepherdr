@@ -10,11 +10,13 @@ Dispatched agents still run with permission checks bypassed (`--dangerously-skip
 
 Exit codes: `0` done, `3` degraded, `2` timeout or failed, `1` usage or herdr error.
 
+A herdr call that takes longer than 10 seconds counts as a herdr error. While watching for a result, `dispatch` keeps going through these errors, so a hung herdr delays a result by up to 10 seconds per check instead of blocking it. If herdr hangs while the agent is being started, `dispatch` exits `1` and names the pane, because the agent may already be running there: check that pane before dispatching again.
+
 ## Activate
 
-1. Install the plugin (see the [top-level README](../README.md)): `herdr plugin install afogel/shepherdr`.
+1. Install the plugin from a clone (see the [top-level README](../README.md)).
 2. Have the superpowers plugin installed in Claude Code.
-3. Symlink the skill into your skills directory. This step assumes a clone of this repo: run it from the root of a clone, cloning first if you only ran `herdr plugin install`, and keep the clone in place because the symlink points into it.
+3. Symlink the skill into your skills directory. Run this from the root of the clone, and keep the clone in place because the symlink points into it.
 
    ```bash
    ln -s "$PWD/superpowers/dispatching-implementers-to-herdr" ~/.claude/skills/dispatching-implementers-to-herdr

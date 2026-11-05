@@ -3,7 +3,7 @@ use crate::protocol::{self, Capture};
 use crate::runner::HerdrRunner;
 use crate::state::{write_record, DispatchRecord};
 use crate::vendors::resolve;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -284,7 +284,10 @@ pub fn dispatch<R: HerdrRunner>(
         &log_file.to_string_lossy(),
         &exited_file.to_string_lossy(),
     );
-    runner.run(&pane_id, &command)?;
+    // herdr may have delivered the command before it stopped answering.
+    runner.run(&pane_id, &command).map_err(|e| {
+        anyhow!("{e}; the agent may already be running in pane {pane_id}, so check that pane before dispatching again")
+    })?;
 
     let tail = protocol::bound_output;
     let mut result = match poll_headless(
@@ -307,8 +310,9 @@ pub fn dispatch<R: HerdrRunner>(
             r
         }
         HeadlessOutcome::Deadline => {
-            let scrollback = runner.read(&pane_id, "recent-unwrapped", 200)?;
-            match protocol::capture_result(&result_file, Some(&scrollback)) {
+            // A herdr failure here must not lose the file or leave the record at working.
+            let scrollback = runner.read(&pane_id, "recent-unwrapped", 200).ok();
+            match protocol::capture_result(&result_file, scrollback.as_deref()) {
                 Capture::File(t) => mk("degraded", "file", tail(&t)),
                 Capture::Scrollback(t) => mk("timeout", "scrollback", tail(&t)),
                 Capture::Missing => mk("timeout", "scrollback", String::new()),
@@ -321,7 +325,10 @@ pub fn dispatch<R: HerdrRunner>(
     record(opts, &vendor, &pane_id, &result.status, &created_at, session_id.as_deref(), &cwd);
 
     if opts.close {
-        runner.close(&pane_id)?;
+        // The work is done and recorded, so a pane left open is only a warning.
+        if let Err(e) = runner.close(&pane_id) {
+            eprintln!("warning: could not close pane {pane_id}: {e}");
+        }
     }
     Ok(result)
 }
@@ -459,6 +466,9 @@ mod tests {
         log_bytes: Option<Vec<u8>>,
         result_bytes: Option<Vec<u8>>,
         scrollback: String,
+        read_errors: bool,
+        close_errors: bool,
+        run_errors: bool,
     }
     impl HerdrRunner for FakeRunner {
         fn split(&self, _p: &str, _d: &str, _f: bool, cwd: Option<&str>) -> anyhow::Result<String> {
@@ -467,6 +477,9 @@ mod tests {
             Ok(format!(r#"{{"result":{{"pane":{{"pane_id":"{}"}}}}}}"#, self.pane_id))
         }
         fn run(&self, _pane: &str, command: &str) -> anyhow::Result<()> {
+            if self.run_errors {
+                anyhow::bail!("herdr pane run timed out");
+            }
             self.commands.borrow_mut().push(command.to_string());
             // the headless command (`cat <...>.prompt.md | ...`) triggers the simulated write
             if command.contains(".prompt.md") {
@@ -504,9 +517,15 @@ mod tests {
             Ok(true)
         }
         fn read(&self, _p: &str, _s: &str, _l: u32) -> anyhow::Result<String> {
+            if self.read_errors {
+                anyhow::bail!("herdr pane read timed out");
+            }
             Ok(self.scrollback.clone())
         }
         fn close(&self, pane: &str) -> anyhow::Result<()> {
+            if self.close_errors {
+                anyhow::bail!("herdr pane close timed out");
+            }
             self.closed.borrow_mut().push(pane.into()); Ok(())
         }
         fn tab_create(&self, _w: &str, _l: &str) -> anyhow::Result<String> { Ok("{}".into()) }
@@ -554,6 +573,9 @@ mod tests {
             log_bytes: None,
             result_bytes: None,
             scrollback: "scrollback".into(),
+            read_errors: false,
+            close_errors: false,
+            run_errors: false,
         }
     }
 
@@ -976,6 +998,56 @@ mod tests {
         assert_eq!(out.status, "timeout");
         assert!(!out.agent_exited);
         assert!(*r.pane_exists_calls.borrow() >= 1, "polling never checked the pane");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn herdr_failing_at_the_deadline_still_reports_timeout_and_updates_the_record() {
+        let dir = tdir("hd-orch-read-err");
+        let state = dir.join("state");
+        let mut r = fake(&dir, "rev-re", WriteMode::Nothing, "");
+        r.read_errors = true;
+        let mut o = opts(&dir, "rev-re");
+        o.state_dir = Some(&state);
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(out.status, "timeout");
+        assert!(!out.agent_exited);
+        assert_eq!(crate::state::read_record(&state, "rev-re").unwrap().unwrap().status, "timeout");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn herdr_failing_at_the_deadline_keeps_a_partial_result_file() {
+        let dir = tdir("hd-orch-read-err-partial");
+        let mut r = fake(&dir, "rev-rp", WriteMode::Incomplete, "half done");
+        r.read_errors = true;
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-rp")).unwrap();
+        assert_eq!(out.status, "degraded");
+        assert_eq!(out.result_text, "half done");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_close_does_not_lose_the_result() {
+        let dir = tdir("hd-orch-close-err");
+        let mut r = fake(&dir, "rev-ce", WriteMode::Complete, "LGTM");
+        r.close_errors = true;
+        let mut o = opts(&dir, "rev-ce");
+        o.close = true;
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(out.status, "done");
+        assert_eq!(out.result_text, "LGTM");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_run_names_the_pane_the_agent_may_be_running_in() {
+        let dir = tdir("hd-orch-run-err");
+        let mut r = fake(&dir, "rev-ru", WriteMode::Nothing, "");
+        r.run_errors = true;
+        let err = dispatch(&r, &default_config(), &opts(&dir, "rev-ru")).unwrap_err().to_string();
+        assert!(err.contains("1-3"), "was: {err}");
+        assert!(err.contains("timed out"), "the cause was dropped: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
