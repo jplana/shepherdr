@@ -16,7 +16,12 @@ enum Cmd {
     /// Reopen a finished dispatch's agent session in a headed pane.
     Resume(ResumeArgs),
     /// Human/keybinding-triggered action face.
-    Action { name: String },
+    Action {
+        name: String,
+        /// For second-opinion: the worktree to review, instead of the focused pane's folder.
+        #[arg(long)]
+        path: Option<String>,
+    },
     /// Workers board pane (declared in the manifest).
     Board,
 }
@@ -70,12 +75,27 @@ fn main() {
                 }
             }
         }
-        Cmd::Action { name } if name == "noop" => println!("ok"),
-        Cmd::Action { name } if name == "second-opinion" => {
+        Cmd::Action { name, .. } if name == "noop" => println!("ok"),
+        Cmd::Action { name, path } if name == "second-opinion" => {
             let ctx_json = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
             let ctx = shepherdr::action::parse_context(&ctx_json);
             let scratch = state_dir_or_here();
-            let context = shepherdr::action::second_opinion_context(&ctx);
+            let Some(path) = path.or_else(|| ctx.worktree_path.clone()) else {
+                eprintln!("action error: no folder to review; pass --path <worktree>");
+                std::process::exit(1);
+            };
+            let diff = match shepherdr::action::read_diff(&path) {
+                Ok(Some(diff)) => diff,
+                Ok(None) => {
+                    println!("no uncommitted changes to tracked files in {path:?}");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("action error: {e}; pass --path <worktree> to review another folder");
+                    std::process::exit(1);
+                }
+            };
+            let context = shepherdr::action::second_opinion_context(&diff);
             let ctx_file = std::path::Path::new(&scratch).join("second-opinion.context.md");
             if let Err(e) = std::fs::create_dir_all(&scratch) {
                 eprintln!("action error: {e}");
@@ -95,7 +115,7 @@ fn main() {
                 Err(e) => { eprintln!("action error: {e}"); std::process::exit(1); }
             }
         }
-        Cmd::Action { name } if name == "resume-last" => {
+        Cmd::Action { name, .. } if name == "resume-last" => {
             let state_dir = state_dir_or_here();
             let records = shepherdr::state::read_records(std::path::Path::new(&state_dir))
                 .unwrap_or_default();
@@ -122,7 +142,7 @@ fn main() {
                 }
             }
         }
-        Cmd::Action { name } => {
+        Cmd::Action { name, .. } => {
             eprintln!("unknown action: {name}");
             std::process::exit(1);
         }
