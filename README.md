@@ -49,7 +49,7 @@ shepherdr dispatch \
   [--interactive]              # opt-in: start a HEADED TUI you drive from the
                                # start (bare TUI + gate-bypass flags, prompt
                                # delivered as one line, pane left live)
-  [--model <m>]                # required for --role implementer
+  [--model <m>]                # required for headless --role implementer; rejected with --interactive
   [--effort low|medium|high|xhigh|max]  # optional, claude only
   [--resume-session <id>]      # headless resume of a captured session; requires --vendor
   [--cwd <dir>]                # working directory for the agent (e.g. a worktree)
@@ -66,7 +66,7 @@ Prints JSON: `{status, task_id, vendor, pane_id, result_file, result_source, res
 
 Exit codes: `0` done, `3` degraded, `2` timeout or failed, `1` usage or herdr error.
 
-`--effort` is claude-only; other values and other vendors are rejected. Without it, a pane agent runs at claude's configured default effort, not the controller's. `--model` is required for `--role implementer`. `--resume-session` requires `--vendor`.
+`--effort` is claude-only; other values and other vendors are rejected. Without it, a pane agent runs at claude's configured default effort, not the controller's. `--model` is required for headless `--role implementer`. `--resume-session` requires `--vendor`. `--model`, `--effort` and `--resume-session` are rejected with `--interactive`.
 
 ## Resuming a finished dispatch
 
