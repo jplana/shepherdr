@@ -33,8 +33,7 @@ unstated assumptions. Be concise and reference file:line.",
     )
 }
 
-/// The dispatch the `second-opinion` action runs, in the context's worktree when
-/// it has one.
+/// The dispatch the `second-opinion` action runs.
 pub fn second_opinion_args(ctx: &PluginContext, scratch: &str, context_file: &str) -> DispatchArgs {
     DispatchArgs {
         role: "reviewer".into(), context_file: context_file.into(),
@@ -44,7 +43,10 @@ pub fn second_opinion_args(ctx: &PluginContext, scratch: &str, context_file: &st
         split_direction: "right".into(), close: false,
         state_dir: Some(scratch.into()), reuse_pane: None, interactive: false,
         model: None, effort: None, resume_session: None,
-        cwd: ctx.worktree_path.clone(),
+        // None, not the worktree: codex runs with hook trust and the sandbox bypassed,
+        // so inside the reviewed worktree that worktree's own config could run. The
+        // prompt reaches the worktree through `git -C` instead.
+        cwd: None,
     }
 }
 
@@ -79,10 +81,10 @@ mod tests {
     }
 
     #[test]
-    fn second_opinion_runs_in_the_context_worktree() {
+    fn second_opinion_stays_out_of_the_context_worktree() {
         let ctx = parse_context(r#"{"focused_pane":{"pane_id":"1-2"},"worktree":{"path":"/repo/wt"}}"#);
         let args = second_opinion_args(&ctx, "/state", "/state/ctx.md");
-        assert_eq!(args.cwd.as_deref(), Some("/repo/wt"));
+        assert!(args.cwd.is_none(), "was: {:?}", args.cwd);
         assert_eq!(args.from_pane, "1-2");
         assert_eq!(args.role, "reviewer");
         assert_eq!(args.context_file, "/state/ctx.md");

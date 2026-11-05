@@ -8,7 +8,7 @@ Plugin id: `afogel.shepherdr`. macOS.
 
 - **`dispatch`** (agent-initiated, called by the `dispatching-implementers-to-herdr` skill): splits a pane, runs a headless agent against a constructed prompt, and captures the agent's result. Completion is detected by **polling the result file** for a trailing sentinel marker (headless agents echo their prompt, so a scrollback sentinel is unreliable). The agent's combined output is teed to a durable `<task-id>.log`, from which the agent **session id** is parsed and stored so the run can be resumed later. The pane streams the agent's work for live/after-the-fact auditing and stays open when done.
 - **`resume`** (CLI): reopens a finished dispatch's captured session in a fresh headed pane, in its original working directory — plain interactive, no autonomy flags. Fails closed if no session id was captured.
-- **`action second-opinion`** (keybinding-triggered, `prefix+r`): dispatches a codex review of the focused worktree's git diff.
+- **`action second-opinion`** (keybinding-triggered, `prefix+r`): dispatches a codex review of the focused worktree's git diff. It runs codex with checks bypassed outside the worktree and reads the diff through `git -C`.
 - **`action resume-last`** (keybinding-triggered, `prefix+shift+r`): reopens the newest resumable dispatch (latest completed dispatch with a captured session id) in a fresh headed pane, in its original working directory.
 - **`event worktree-created`**: auto-creates a `workers` tab.
 - **`board`**: an overlay pane rendering a live table of active dispatches from the plugin state dir, including a SESSION column so you can see at a glance which dispatches are resumable.
