@@ -39,10 +39,11 @@ pub struct DispatchResult {
     pub pane_id: String,
     pub result_file: String,
     pub result_source: String,
-    pub result_text: String,
     pub session_id: Option<String>,
     pub log_file: String,
     pub agent_exited: bool,
+    // Last, so that the identity fields stay visible when the JSON is cut short.
+    pub result_text: String,
 }
 
 fn record(
@@ -85,8 +86,6 @@ fn poll_result_file(result_file: &Path, task_id: &str, timeout_ms: u64) -> Optio
     }
 }
 
-const OUTPUT_TAIL_LINES: usize = 40;
-
 enum HeadlessOutcome {
     /// Complete result and whether the exit marker showed up within the grace.
     Done { text: String, exited: bool },
@@ -96,7 +95,7 @@ enum HeadlessOutcome {
 }
 
 fn read_complete(result_file: &Path, task_id: &str) -> Option<String> {
-    let text = std::fs::read_to_string(result_file).ok()?;
+    let text = protocol::read_lossy(result_file)?;
     protocol::extract_complete_result(&text, task_id)
 }
 
@@ -257,7 +256,7 @@ pub fn dispatch<R: HerdrRunner>(
     let command = format!("{cd}{base} 2>&1 | tee {quoted_log}; touch {quoted_marker}");
     runner.run(&pane_id, &command)?;
 
-    let tail = |t: &str| protocol::tail_lines(t, OUTPUT_TAIL_LINES);
+    let tail = protocol::bound_output;
     let mut result = match poll_headless(
         &result_file, &exited_file, opts.task_id, opts.timeout_ms, opts.exit_grace_ms,
     ) {
@@ -267,10 +266,10 @@ pub fn dispatch<R: HerdrRunner>(
             r
         }
         HeadlessOutcome::Exited => {
-            let mut r = match std::fs::read_to_string(&result_file) {
-                Ok(t) => mk("failed", "file", tail(&t)),
-                Err(_) => {
-                    let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+            let mut r = match protocol::read_lossy(&result_file) {
+                Some(t) => mk("failed", "file", tail(&t)),
+                None => {
+                    let log = protocol::read_lossy(&log_file).unwrap_or_default();
                     mk("failed", "log", tail(&log))
                 }
             };
@@ -286,8 +285,7 @@ pub fn dispatch<R: HerdrRunner>(
             }
         }
     };
-    let session_id = std::fs::read_to_string(&log_file)
-        .ok()
+    let session_id = protocol::read_lossy(&log_file)
         .and_then(|log| crate::session::extract_session_id(&vendor, &log));
     result.session_id = session_id.clone();
     record(opts, &vendor, &pane_id, &result.status, &created_at, session_id.as_deref(), &cwd);
@@ -422,6 +420,8 @@ mod tests {
         commands: RefCell<Vec<String>>,
         exits: bool,
         log_text: String,
+        log_bytes: Option<Vec<u8>>,
+        result_bytes: Option<Vec<u8>>,
         scrollback: String,
     }
     impl HerdrRunner for FakeRunner {
@@ -448,8 +448,14 @@ mod tests {
                     }
                     WriteMode::Nothing => {}
                 }
+                if let Some(bytes) = &self.result_bytes {
+                    std::fs::write(result_path(&self.scratch, &self.task_id), bytes).unwrap();
+                }
                 let log = crate::protocol::log_path(&self.scratch, &self.task_id);
-                std::fs::write(log, &self.log_text).unwrap();
+                match &self.log_bytes {
+                    Some(bytes) => std::fs::write(log, bytes).unwrap(),
+                    None => std::fs::write(log, &self.log_text).unwrap(),
+                }
                 if self.exits {
                     std::fs::write(protocol::exited_path(&self.scratch, &self.task_id), "").unwrap();
                 }
@@ -494,6 +500,8 @@ mod tests {
             commands: RefCell::new(vec![]),
             exits: false,
             log_text: "session id: 11111111-2222-3333-4444-555555555555\nwork output\n".into(),
+            log_bytes: None,
+            result_bytes: None,
             scrollback: "scrollback".into(),
         }
     }
@@ -746,6 +754,83 @@ mod tests {
         assert_eq!(out.status, "degraded");
         assert_eq!(out.result_text.lines().count(), 40);
         assert!(!out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_bounds_a_very_long_log_line_to_8_kib() {
+        let dir = tdir("hd-orch-long-log");
+        let mut r = fake(&dir, "rev-ll", WriteMode::Nothing, "");
+        r.exits = true;
+        r.log_text = format!("{}END", "x".repeat(100_000));
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-ll")).unwrap();
+        assert_eq!(out.status, "failed");
+        assert!(out.result_text.len() <= 8192, "was {} bytes", out.result_text.len());
+        assert!(out.result_text.starts_with(protocol::OUTPUT_TRUNCATED_MARKER));
+        assert!(out.result_text.ends_with("xEND"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn timeout_bounds_a_very_long_scrollback_line_to_8_kib() {
+        let dir = tdir("hd-orch-long-sb");
+        let mut r = fake(&dir, "rev-ls", WriteMode::Nothing, "");
+        r.scrollback = "s".repeat(100_000);
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-ls")).unwrap();
+        assert_eq!(out.status, "timeout");
+        assert!(out.result_text.len() <= 8192, "was {} bytes", out.result_text.len());
+        assert!(out.result_text.starts_with(protocol::OUTPUT_TRUNCATED_MARKER));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn degraded_bounds_a_very_long_partial_file_line_to_8_kib() {
+        let dir = tdir("hd-orch-long-deg");
+        let r = fake(&dir, "rev-ld", WriteMode::Incomplete, &"p".repeat(100_000));
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-ld")).unwrap();
+        assert_eq!(out.status, "degraded");
+        assert!(out.result_text.len() <= 8192, "was {} bytes", out.result_text.len());
+        assert!(out.result_text.starts_with(protocol::OUTPUT_TRUNCATED_MARKER));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_utf8_log_still_gives_text_and_session_id() {
+        let dir = tdir("hd-orch-bad-log");
+        let mut r = fake(&dir, "rev-bl", WriteMode::Nothing, "");
+        r.exits = true;
+        r.log_bytes = Some(
+            b"session id: 11111111-2222-3333-4444-555555555555\nbad \xff byte\nthe error\n".to_vec(),
+        );
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-bl")).unwrap();
+        assert_eq!(out.status, "failed");
+        assert_eq!(out.result_source, "log");
+        assert!(out.result_text.contains("the error"), "was: {}", out.result_text);
+        assert_eq!(out.session_id.as_deref(), Some("11111111-2222-3333-4444-555555555555"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn complete_result_with_invalid_utf8_is_done() {
+        let dir = tdir("hd-orch-bad-result");
+        let mut r = fake(&dir, "rev-br", WriteMode::Nothing, "");
+        r.result_bytes = Some(b"DONE \xff report\nDONE::rev-br".to_vec());
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-br")).unwrap();
+        assert_eq!(out.status, "done");
+        assert_eq!(out.result_text, "DONE \u{fffd} report");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn json_puts_identity_fields_before_result_text() {
+        let dir = tdir("hd-orch-json-order");
+        let r = fake(&dir, "rev-jo", WriteMode::Complete, "ok");
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-jo")).unwrap();
+        let json = serde_json::to_string(&out).unwrap();
+        let at = |key: &str| json.find(&format!("\"{key}\":")).unwrap();
+        for key in ["session_id", "log_file", "agent_exited"] {
+            assert!(at(key) < at("result_text"), "{key} after result_text: {json}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
