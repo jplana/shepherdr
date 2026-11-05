@@ -10,7 +10,7 @@ Plugin id: `jplana.shepherdr`. macOS.
 - **`resume`** (CLI): reopens a finished dispatch's captured session in a fresh headed pane, in its original working directory — plain interactive, no autonomy flags. Fails closed if no session id was captured.
 - **`action second-opinion`** (keybinding-triggered, `prefix+r`): dispatches a codex review of the focused worktree's git diff, in a read-only sandbox, from the directory the action was launched from. It reads the diff with `git -C`, which honors the reviewed repo's git config. In a test, the sandbox stopped a hostile git config from writing outside the repo. Code from that config still runs and can read files, and network access was not tested, so use it only on worktrees you trust.
 - **`action resume-last`** (keybinding-triggered, `prefix+shift+r`): reopens the newest resumable dispatch (latest completed dispatch with a captured session id) in a fresh headed pane, in its original working directory.
-- **`board`**: an overlay pane rendering a live table of active dispatches from the plugin state dir, including a SESSION column so you can see at a glance which dispatches are resumable.
+- **`board`**: an overlay pane rendering a live table of the 20 newest dispatches from the plugin state dir, including a SESSION column so you can see at a glance which dispatches are resumable.
 
 ## Install
 
@@ -55,7 +55,9 @@ shepherdr dispatch \
   [--split-direction right|down]        # with --placement split
   [--keep-open]                # keep the tab or pane after a clean finish
   [--headless]                 # run claude with -p instead of its real interface
-  [--state-dir <dir>]          # write a DispatchRecord here for the board
+  [--state-dir <dir>]          # where to write the DispatchRecord (default: the plugin's state folder,
+                               # ~/.local/state/herdr/plugins/jplana.shepherdr, which the board and
+                               # resume-last read)
 ```
 
 Prints JSON: `{status, task_id, vendor, pane_id, result_file, result_source, session_id, log_file, agent_exited, result_text}`.

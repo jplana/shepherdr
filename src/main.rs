@@ -30,10 +30,24 @@ fn status_exit_code(status: &str) -> i32 {
     }
 }
 
+/// The folder dispatch records live in: what herdr gave this plugin, or else its usual place.
+fn plugin_state_dir() -> Option<std::path::PathBuf> {
+    let var = |name: &str| std::env::var(name).ok();
+    shepherdr::state::state_dir(var("HERDR_PLUGIN_STATE_DIR"), var("XDG_STATE_HOME"), var("HOME"))
+}
+
+fn state_dir_or_here() -> String {
+    plugin_state_dir().map_or_else(|| ".".into(), |dir| dir.to_string_lossy().into_owned())
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Dispatch(args) => {
+        Cmd::Dispatch(mut args) => {
+            // Every dispatch is recorded, so that the board and resume-last can see it.
+            if args.state_dir.is_none() {
+                args.state_dir = plugin_state_dir().map(|dir| dir.to_string_lossy().into_owned());
+            }
             let runner = CliRunner::system();
             match run_dispatch(&args, &runner) {
                 Ok(result) => {
@@ -60,7 +74,7 @@ fn main() {
         Cmd::Action { name } if name == "second-opinion" => {
             let ctx_json = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
             let ctx = shepherdr::action::parse_context(&ctx_json);
-            let scratch = std::env::var("HERDR_PLUGIN_STATE_DIR").unwrap_or_else(|_| ".".into());
+            let scratch = state_dir_or_here();
             let context = shepherdr::action::second_opinion_context(&ctx);
             let ctx_file = std::path::Path::new(&scratch).join("second-opinion.context.md");
             if let Err(e) = std::fs::create_dir_all(&scratch) {
@@ -82,7 +96,7 @@ fn main() {
             }
         }
         Cmd::Action { name } if name == "resume-last" => {
-            let state_dir = std::env::var("HERDR_PLUGIN_STATE_DIR").unwrap_or_else(|_| ".".into());
+            let state_dir = state_dir_or_here();
             let records = shepherdr::state::read_records(std::path::Path::new(&state_dir))
                 .unwrap_or_default();
             match shepherdr::state::latest_resumable(&records) {
@@ -113,7 +127,7 @@ fn main() {
             std::process::exit(1);
         }
         Cmd::Board => {
-            let state_dir = std::env::var("HERDR_PLUGIN_STATE_DIR").unwrap_or_else(|_| ".".into());
+            let state_dir = state_dir_or_here();
             shepherdr::board::run_board_loop(std::path::Path::new(&state_dir));
         }
     }

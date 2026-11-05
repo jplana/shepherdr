@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const PLUGIN_ID: &str = "jplana.shepherdr";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DispatchRecord {
@@ -66,6 +68,30 @@ pub fn read_record(state_dir: &Path, task_id: &str) -> Result<Option<DispatchRec
     }
     let text = std::fs::read_to_string(&path)?;
     Ok(serde_json::from_str::<DispatchRecord>(&text).ok())
+}
+
+/// Where dispatch records live, which is the folder herdr gives this plugin. Plugin
+/// commands get it from herdr. Other callers, such as the skill's dispatches, work it out.
+pub fn state_dir(
+    plugin_env: Option<String>,
+    xdg_state_home: Option<String>,
+    home: Option<String>,
+) -> Option<PathBuf> {
+    let given = |v: Option<String>| v.filter(|s| !s.is_empty());
+    if let Some(dir) = given(plugin_env) {
+        return Some(PathBuf::from(dir));
+    }
+    let base = given(xdg_state_home)
+        .map(PathBuf::from)
+        .or_else(|| given(home).map(|home| Path::new(&home).join(".local/state")))?;
+    Some(base.join("herdr/plugins").join(PLUGIN_ID))
+}
+
+/// The newest `n` records, newest first.
+pub fn newest(mut records: Vec<DispatchRecord>, n: usize) -> Vec<DispatchRecord> {
+    records.sort_by_key(|r| std::cmp::Reverse(r.created_at.parse::<u128>().unwrap_or(0)));
+    records.truncate(n);
+    records
 }
 
 /// The newest resumable dispatch: latest `created_at` among records that have
@@ -172,5 +198,34 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, "done");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn state_dir_prefers_what_herdr_gave_the_plugin() {
+        let got = state_dir(Some("/from/herdr".into()), Some("/xdg".into()), Some("/home/me".into()));
+        assert_eq!(got.unwrap(), Path::new("/from/herdr"));
+    }
+
+    #[test]
+    fn state_dir_is_worked_out_the_way_herdr_lays_it_out() {
+        let got = state_dir(None, None, Some("/home/me".into()));
+        assert_eq!(got.unwrap(), Path::new("/home/me/.local/state/herdr/plugins/jplana.shepherdr"));
+        let got = state_dir(None, Some("/xdg".into()), Some("/home/me".into()));
+        assert_eq!(got.unwrap(), Path::new("/xdg/herdr/plugins/jplana.shepherdr"));
+    }
+
+    #[test]
+    fn state_dir_ignores_empty_values_and_can_be_unknown() {
+        let got = state_dir(Some(String::new()), Some(String::new()), Some("/home/me".into()));
+        assert_eq!(got.unwrap(), Path::new("/home/me/.local/state/herdr/plugins/jplana.shepherdr"));
+        assert!(state_dir(None, None, None).is_none());
+    }
+
+    #[test]
+    fn newest_keeps_the_latest_records_newest_first() {
+        let at = |id: &str, created: &str| DispatchRecord { created_at: created.into(), ..rec(id, "done") };
+        let kept = newest(vec![at("a", "9"), at("b", "100"), at("c", "20")], 2);
+        let ids: Vec<&str> = kept.iter().map(|r| r.task_id.as_str()).collect();
+        assert_eq!(ids, ["b", "c"], "100 is newer than 20 and 9, compared as numbers");
     }
 }
