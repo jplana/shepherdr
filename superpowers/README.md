@@ -14,7 +14,7 @@ Exit codes: `0` done, `3` degraded, `2` timeout or failed, `1` usage or herdr er
 
 1. Install the plugin (see the [top-level README](../README.md)): `herdr plugin install afogel/shepherdr`.
 2. Have the superpowers plugin installed in Claude Code.
-3. Symlink the skill into your skills directory:
+3. Symlink the skill into your skills directory. This step assumes a clone of this repo: run it from the root of a clone, cloning first if you only ran `herdr plugin install`, and keep the clone in place because the symlink points into it.
 
    ```bash
    ln -s "$PWD/superpowers/dispatching-implementers-to-herdr" ~/.claude/skills/dispatching-implementers-to-herdr
@@ -31,6 +31,8 @@ Exit codes: `0` done, `3` degraded, `2` timeout or failed, `1` usage or herdr er
    ```
 
 5. Run Claude Code inside a herdr session (`HERDR_ENV=1`).
+
+Upgrading from an older shepherdr: remove its overlay symlinks from `~/.claude/skills/` (every `*-herdr` link except `dispatching-implementers-to-herdr`) and delete the old herdr block from your CLAUDE.md, which the block above replaces.
 
 ## Manual tools
 

@@ -59,9 +59,10 @@ shepherdr dispatch \
   [--state-dir <dir>]          # write a DispatchRecord here for the board
 ```
 
-Prints JSON: `{status, task_id, vendor, pane_id, result_file, result_source, result_text, session_id, log_file, agent_exited}`.
+Prints JSON: `{status, task_id, vendor, pane_id, result_file, result_source, session_id, log_file, agent_exited, result_text}`.
 `session_id` is the captured agent session (null when none was found); it is what `resume` and `--resume-session` reuse.
-`log_file` is the durable `<task-id>.log` tee of the agent's output. `agent_exited` is true when shepherdr saw the agent process exit.
+`log_file` is the durable `<task-id>.log` tee of the agent's output. `agent_exited` is true when the pane command left its `<task-id>.exited` marker or herdr reports the pane gone.
+`result_text` holds the agent's result on `done`. On `failed`, `timeout` and `degraded` it is bounded to the last 40 lines and at most 8 KiB, with a leading marker when the byte cap dropped text; the rest is in `log_file`.
 `status` is `done` (result file complete), `degraded` (partial file at timeout), `timeout` (no file; `result_text` carries the pane scrollback for diagnosis), or `failed` (the agent exited without a complete result).
 
 Exit codes: `0` done, `3` degraded, `2` timeout or failed, `1` usage or herdr error.
@@ -113,6 +114,8 @@ session id is captured and `session_id` stays null.
 
 `dispatch` writes `<scratch>/<task-id>.prompt.md` = your context + a footer telling the agent to write its result to `<scratch>/<task-id>.result.md` with the final line being exactly `DONE::<task-id>`. It then polls that file until the marker appears (or the timeout), reads the result (marker stripped), and reports. A stale result file from a prior run is removed before dispatch.
 
+The pane command runs the agent under its own `sh -c`, with traps that create `<scratch>/<task-id>.exited` when the agent pipeline ends, whether by a normal or nonzero exit, SIGINT, SIGTERM or SIGHUP, or a failed `cd`. That marker with no complete result gives `failed` at once instead of waiting for the timeout. So does a pane that herdr reports gone; a herdr error does not count. A complete result is always `done`.
+
 ## Superpowers integration
 
 shepherdr ships one skill, [`dispatching-implementers-to-herdr`](superpowers/dispatching-implementers-to-herdr/SKILL.md). When `HERDR_ENV=1`, it maps each place where `superpowers:subagent-driven-development` dispatches or resumes an implementer onto `shepherdr dispatch`. Every other Superpowers step runs unchanged, and only code-writing subagents get panes; reviewers stay native. Implementers in this flow are Claude only.
@@ -128,6 +131,7 @@ Outside the Superpowers flow you can use `second-opinion` (`prefix+r`), `resume-
 ```bash
 cargo test        # unit tests with an injected fake HerdrRunner (no live socket)
 cargo clippy --all-targets -- -D warnings
+cargo build && python3 -I tests/exit-marker-pty.py   # the pane command under zsh and bash on a pty (stub agent, no herdr)
 ```
 
 The `HerdrRunner` trait (`src/runner.rs`) is the seam over the `herdr` CLI (`HERDR_BIN_PATH`); tests inject a recording/fake implementation.

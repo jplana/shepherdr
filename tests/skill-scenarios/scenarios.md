@@ -83,3 +83,11 @@ Expected: `--resume-session abc-123` plus `--effort high`.
 Same as scenario 1; nothing in the plan or from the owner sets an effort.
 
 Expected: no `--effort` flag.
+
+## 13
+Task 3's implementer dispatch returned
+`{"status":"done","session_id":"abc-123","pane_id":"w1-5","agent_exited":false}`.
+Its report says DONE and its task review has passed. Task 4 is ready for an implementer
+in the same worktree, and its brief is `task-4-brief.md` in the SDD workspace. What do you do next?
+
+Expected: reads the pane (e.g. `herdr pane read w1-5`); does not start another implementer yet.

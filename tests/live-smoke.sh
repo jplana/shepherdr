@@ -99,5 +99,15 @@ if [ "$S3" = failed ] && [ $((T1-T0)) -lt 60 ] && [ -n "$R3" ]; then
   pass "failure path (failed in $((T1-T0))s)"
 else fail "failure path status=$S3 elapsed=$((T1-T0))s result=$R3"; cat "$TMP/t3.err"; fi
 
+# 5. Early stop: an implementer that stops to ask still writes its message and sentinel
+OUT4="$(dispatch t4 "Task: add a database importer. You are missing one fact. Do not do any of the work and do not create any files. Stop now and report status NEEDS_CONTEXT with this question: which database should the importer target?" \
+  --model haiku --effort low --timeout-ms 300000)"
+echo "$OUT4" | head -c 1500; echo
+S4="$(echo "$OUT4" | jget status)"; R4="$(echo "$OUT4" | jget result_text)"
+note_pane "$(echo "$OUT4" | jget pane_id)"
+if [ "$S4" = done ] && echo "$R4" | grep -q NEEDS_CONTEXT; then
+  pass "early stop (done, result_text has NEEDS_CONTEXT)"
+else fail "early stop status=$S4 result=$R4"; cat "$TMP/t4.err"; fi
+
 echo "failures: $FAILS"
 [ "$FAILS" = 0 ]

@@ -83,7 +83,8 @@ run instead of the native subagent tool? It requires
 | Fix rounds 4-5: fresh implementer on a more capable model | Write a new context file naming the brief path, report path and findings, and pass that as `--context-file`. Then a dispatch without `--resume-session`, with the higher `--model`. |
 | Final-review fix subagent | A fresh dispatch, because it writes code. Any stock subagent that writes code counts as an implementer; any that only reads stays native. |
 | Wait for the implementer | Stock's waiting rule applies; the dispatch is a background command that reports when it exits. |
-| `status: failed` (agent exited without a complete result) | Read the task log, then handle as stock's BLOCKED. |
+| `status: failed` (agent exited without a complete result) | Read `result_text`, then a bounded tail of `log_file` if that is not enough. Handle as stock's BLOCKED. |
+| `status: done` with `agent_exited: false` | Read the pane before any further dispatch in that worktree. If the shell prompt has returned, carry on. If the agent is still running, handle it as `status: timeout`. |
 | `status: timeout` or `degraded` (agent has not exited) | The agent is still running. Never start another implementer in that worktree while it runs. Read the pane; if it looks stuck, interrupt it with `herdr pane send-keys <pane_id> ctrl+c` and confirm the shell prompt has returned. Then handle as stock's BLOCKED, resuming if a `session_id` exists. |
 | A failure or timeout looks like a claude outage or limit | Stop and tell the owner. There is no vendor to fall back to. |
 
@@ -92,9 +93,13 @@ Skill rules that stock does not supply:
 - `--task-id` is unique per dispatch, for example `task-3-impl-r2`, because a
   dispatch deletes any earlier result and log with the same ID.
 - `--scratch` is the absolute path printed by stock's `sdd-workspace`.
-- `--from-pane` is the workers tab's root pane, from
-  `herdr tab create --workspace <id> --cwd <worktree> --label workers`, reusing
-  an existing workers tab if there is one.
+- `--from-pane` is the workers tab's root pane. The workspace ID is
+  `$HERDR_WORKSPACE_ID`. Create the tab with
+  `herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd <worktree> --label workers --no-focus`;
+  its JSON holds the root pane at `result.root_pane.pane_id`. If
+  `herdr tab list --workspace "$HERDR_WORKSPACE_ID"` already shows a tab labelled
+  `workers`, reuse it: its root pane is the first pane with that `tab_id` in
+  `herdr pane list --workspace "$HERDR_WORKSPACE_ID"`.
 
 **Activation:** one symlink into `~/.claude/skills/` and a short CLAUDE.md block
 saying that with `HERDR_ENV=1`, SDD implementer dispatches use this skill. The
@@ -125,28 +130,41 @@ description is triggering conditions only: when executing a plan with
   process's working directory. When a pane is reused, the command is prefixed
   with `cd <path> &&`. Today nothing sets this for headless runs, so an
   implementer could run outside the worktree. It is included because stock's
-  worktree isolation depends on it.
-- **Exit detection for headless runs.** The pane command gains a trailing step
-  that creates `<scratch>/<task-id>.exited` whatever the agent's exit code was,
-  and dispatch clears that file beforehand as it does the result and log. While
-  polling:
+  worktree isolation depends on it. The `second-opinion` action passes its
+  context's worktree when it has one.
+- **Exit detection for headless runs.** The pane command runs the agent pipeline
+  under its own `sh -c`, with traps that create `<scratch>/<task-id>.exited` when
+  that `sh` exits: on a normal or nonzero exit, on SIGINT, SIGTERM or SIGHUP, and
+  when a reused pane's `cd` fails, whichever shell the pane runs. The `sh` acts on
+  a signal only after the pipeline has ended, so the marker always means the agent
+  is gone. Dispatch clears that file beforehand as it does the result and log.
+  While polling:
   - The marker with no complete result gives a new `status: failed`, with exit
     code 2, immediately instead of at the deadline.
-  - After a complete result, dispatch waits up to 30 seconds for the marker,
-    because an agent can write its result before it exits.
+  - A pane that herdr reports gone counts the same as the marker, so it also gives
+    `failed` with `agent_exited: true`. An error from herdr does not count as gone.
+  - The result file is re-read before either of those is believed: a complete
+    result is always `done`.
+  - After a complete result, dispatch waits up to 30 seconds for the marker or the
+    pane going away, because an agent can write its result before it exits.
   - The JSON gains `agent_exited`, which says whether a pane is safe to reuse:
     `pane run` on a pane with a live agent would go to that agent's input.
-  - A `degraded` or `timeout` status now always means the marker never appeared.
+  - A `degraded` or `timeout` status now always means the marker never appeared
+    and the pane was still there.
   This is included because implementer timeouts must be long, and without it a
   dead agent would cost the full hour. `--interactive` is unchanged.
 - **Bounded output.** `result_text` holds the agent's short status contract on
   `done`. On `failed`, `timeout` and `degraded`, it holds no more than the last
-  40 lines, and the JSON gains `log_file` so the rest stays out of the
-  controller's context. The JSON's other fields stay the same.
+  40 lines and at most 8 KiB, cut on a character boundary, with a leading marker
+  when the byte cap dropped text. The JSON gains `log_file` so the rest stays out
+  of the controller's context, and `session_id`, `log_file` and `agent_exited`
+  come before `result_text`. The JSON's other fields stay the same.
 - **Prompt preamble for implementers.** The prompt gains a leading line stating
   that the agent is a subagent dispatched to execute one specific task. That is
   the condition `using-superpowers` uses to stand down; headless `claude -p`
-  does load that skill at startup.
+  does load that skill at startup. For implementers only, the footer's "when you
+  have finished" also covers stopping early to ask a question or report being
+  blocked, so such a stop comes back as `done` with the message in `result_text`.
 
 `HERDR_ENV` is not unset in panes, because herdr's own agent integration may use
 it. With the pipeline block gone from CLAUDE.md, it no longer starts a workflow.
@@ -193,7 +211,8 @@ and that `degraded` exits with code 3.
 - Adding exit detection, with the `failed` status and `agent_exited`. The first
   draft left this for later, but the timeout handling depends on it.
 - Treating the final-review fix subagent as an implementer, so it gets a pane.
-- The skill name, the 40-line cap, the 30-second wait and the `log_file` field.
+- The skill name, the 40-line and 8 KiB caps, the 30-second wait and the
+  `log_file` field.
 - Activation by symlink and CLAUDE.md block, kept simple until plugin packaging.
 
 ## Left to the builder
