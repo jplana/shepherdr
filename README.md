@@ -2,7 +2,7 @@
 
 **shepherdr** (shep·herdr) is a [herdr](https://herdr.dev) plugin that runs the code-writing subagents of [superpowers](https://github.com/obra/superpowers) in herdr terminal panes, so you can watch, resume, and take over their work instead of facing opaque in-process subagents. Superpowers' stock steps run unchanged; shepherdr only changes where code-writing subagents run. Reviewers stay native.
 
-Plugin id: `afogel.shepherdr`. macOS.
+Plugin id: `jplana.shepherdr`. macOS.
 
 ## What it does
 
@@ -14,7 +14,7 @@ Plugin id: `afogel.shepherdr`. macOS.
 
 ## Install
 
-This is a fork of [afogel/shepherdr](https://github.com/afogel/shepherdr). Install it from a clone: `herdr plugin install afogel/shepherdr` installs the upstream code, which doesn't have the Superpowers 7 integration. The plugin id is still `afogel.shepherdr`.
+This is a fork of [afogel/shepherdr](https://github.com/afogel/shepherdr). Install it from a clone: `herdr plugin install afogel/shepherdr` installs the upstream code, which doesn't have the Superpowers 7 integration.
 
 Requires the Rust toolchain.
 
@@ -23,7 +23,7 @@ git clone https://github.com/jplana/shepherdr.git
 cd shepherdr
 cargo install --path .            # `link` does not build, so build it yourself
 herdr plugin link "$PWD"
-herdr plugin action list --plugin afogel.shepherdr   # sanity check
+herdr plugin action list --plugin jplana.shepherdr   # sanity check
 ```
 
 herdr and your shell both run `shepherdr` by name. If `~/.cargo/bin` isn't on their `PATH`, symlink the binary into a directory that is, such as `ln -s ~/.cargo/bin/shepherdr ~/.local/bin/shepherdr`.

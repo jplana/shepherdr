@@ -6,7 +6,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/debug/shepherdr"
-PLUGIN_ID="afogel.shepherdr"
+PLUGIN_ID="jplana.shepherdr"
 
 if [ "${HERDR_ENV:-}" != "1" ] || [ -z "${HERDR_PANE_ID:-}" ]; then
   echo "BLOCKED: needs HERDR_ENV=1 and HERDR_PANE_ID"; exit 2
