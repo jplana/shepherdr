@@ -56,6 +56,23 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// The command typed into a headless agent's pane. It runs under its own `sh`,
+/// so whether the marker appears does not depend on how the pane's shell treats
+/// an interrupted command list. The EXIT trap leaves the marker once the pipeline
+/// has ended, however it ended, and also when `cd` fails. The signal traps turn a
+/// signal into a normal exit, because a shell killed by a signal may skip its EXIT
+/// trap. `sh` runs them only after the foreground pipeline has ended, so a marker
+/// always means the agent is gone. The marker path is passed as `$1`.
+pub fn pane_command(cd_to: Option<&str>, base: &str, log_file: &str, marker: &str) -> String {
+    let cd = cd_to.map_or(String::new(), |dir| format!("cd {} && ", shell_quote(dir)));
+    let script = format!(
+        "trap 'touch \"$1\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+{cd}{base} 2>&1 | tee {}",
+        shell_quote(log_file),
+    );
+    format!("sh -c {} sh {}", shell_quote(&script), shell_quote(marker))
+}
+
 pub fn build_prompt(context: &str, task_id: &str, result_file: &str, role: &str) -> String {
     let implementer = role == "implementer";
     let (head, what) = if implementer {
@@ -230,6 +247,62 @@ mod tests {
     fn shell_quote_wraps_and_escapes_single_quotes() {
         assert_eq!(shell_quote("/a b/c"), "'/a b/c'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    /// Run a pane command under a real `sh`; the stand-in agent is plain shell.
+    fn run_in_sh(command: &str) {
+        std::process::Command::new("sh").arg("-c").arg(command).output().unwrap();
+    }
+
+    fn pane_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hd proto it's {name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn pane_command_wraps_everything_in_sh_with_the_marker_as_an_argument() {
+        let out = pane_command(Some("/w t"), "cat '/p' | agent", "/l og", "/m k");
+        assert!(out.starts_with("sh -c '"), "was: {out}");
+        assert!(out.ends_with(" sh '/m k'"), "was: {out}");
+        for trap in [r#"touch "$1"'\'' EXIT"#, r"exit 129'\'' HUP", r"exit 130'\'' INT", r"exit 143'\'' TERM"] {
+            assert!(out.contains(trap), "no {trap} in: {out}");
+        }
+    }
+
+    #[test]
+    fn pane_command_leaves_marker_and_log_on_normal_and_nonzero_exit() {
+        for (name, agent) in [("zero", "echo agent-output"), ("nonzero", "echo agent-output; exit 7")] {
+            let dir = pane_dir(name);
+            let (log, marker) = (dir.join("t.log"), dir.join("t.exited"));
+            let base = format!("printf x | sh -c {}", shell_quote(agent));
+            run_in_sh(&pane_command(None, &base, log.to_str().unwrap(), marker.to_str().unwrap()));
+            assert!(marker.exists(), "{name}: no marker");
+            assert!(std::fs::read_to_string(&log).unwrap().contains("agent-output"), "{name}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn pane_command_runs_the_agent_in_the_given_directory() {
+        let dir = pane_dir("cd");
+        let (log, marker) = (dir.join("t.log"), dir.join("t.exited"));
+        run_in_sh(&pane_command(Some(dir.to_str().unwrap()), "pwd", log.to_str().unwrap(), marker.to_str().unwrap()));
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.trim_end().ends_with(dir.file_name().unwrap().to_str().unwrap()), "was: {logged}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pane_command_leaves_marker_when_cd_fails_and_skips_the_agent() {
+        let dir = pane_dir("cd-fail");
+        let (log, marker, ran) = (dir.join("t.log"), dir.join("t.exited"), dir.join("ran"));
+        let base = format!("touch {}", shell_quote(ran.to_str().unwrap()));
+        run_in_sh(&pane_command(Some("/definitely/not/here"), &base, log.to_str().unwrap(), marker.to_str().unwrap()));
+        assert!(marker.exists());
+        assert!(!ran.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

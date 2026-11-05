@@ -87,9 +87,9 @@ fn poll_result_file(result_file: &Path, task_id: &str, timeout_ms: u64) -> Optio
 }
 
 enum HeadlessOutcome {
-    /// Complete result and whether the exit marker showed up within the grace.
+    /// Complete result and whether the agent's exit showed up within the grace.
     Done { text: String, exited: bool },
-    /// Exit marker present but no complete result.
+    /// Agent exited (marker present or pane gone) with no complete result.
     Exited,
     Deadline,
 }
@@ -99,11 +99,41 @@ fn read_complete(result_file: &Path, task_id: &str) -> Option<String> {
     protocol::extract_complete_result(&text, task_id)
 }
 
-/// Wait up to `grace_ms` for the exit marker (always checks at least once).
-fn marker_within_grace(marker: &Path, grace_ms: u64) -> bool {
+/// Asking herdr spawns a process, so this checks less often than the file polls.
+const PANE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Whether the pane has gone away, checking herdr at most once per interval. A
+/// herdr error is not evidence that the pane is gone.
+struct PaneWatch<'a, R: HerdrRunner> {
+    runner: &'a R,
+    pane: &'a str,
+    next_check: Instant,
+}
+
+impl<'a, R: HerdrRunner> PaneWatch<'a, R> {
+    fn new(runner: &'a R, pane: &'a str) -> Self {
+        PaneWatch { runner, pane, next_check: Instant::now() }
+    }
+
+    fn gone(&mut self) -> bool {
+        if Instant::now() < self.next_check {
+            return false;
+        }
+        self.next_check = Instant::now() + PANE_CHECK_INTERVAL;
+        matches!(self.runner.pane_exists(self.pane), Ok(false))
+    }
+}
+
+/// Wait up to `grace_ms` for the exit marker or the pane going away (always
+/// checks at least once).
+fn exited_within_grace<R: HerdrRunner>(
+    panes: &mut PaneWatch<R>,
+    marker: &Path,
+    grace_ms: u64,
+) -> bool {
     let deadline = Instant::now() + Duration::from_millis(grace_ms);
     loop {
-        if marker.exists() {
+        if marker.exists() || panes.gone() {
             return true;
         }
         if Instant::now() >= deadline {
@@ -113,8 +143,11 @@ fn marker_within_grace(marker: &Path, grace_ms: u64) -> bool {
     }
 }
 
-/// Poll for a complete result, the agent-exit marker, or the deadline.
-fn poll_headless(
+/// Poll for a complete result, the agent's exit, or the deadline. The agent has
+/// exited if the marker appeared or its pane is gone.
+fn poll_headless<R: HerdrRunner>(
+    runner: &R,
+    pane: &str,
     result_file: &Path,
     marker: &Path,
     task_id: &str,
@@ -123,12 +156,13 @@ fn poll_headless(
 ) -> HeadlessOutcome {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let poll = Duration::from_millis(200);
+    let mut panes = PaneWatch::new(runner, pane);
     loop {
         if let Some(text) = read_complete(result_file, task_id) {
-            let exited = marker_within_grace(marker, grace_ms);
+            let exited = exited_within_grace(&mut panes, marker, grace_ms);
             return HeadlessOutcome::Done { text, exited };
         }
-        if marker.exists() {
+        if marker.exists() || panes.gone() {
             // The agent may have finished between the two reads.
             return match read_complete(result_file, task_id) {
                 Some(text) => HeadlessOutcome::Done { text, exited: true },
@@ -244,21 +278,17 @@ pub fn dispatch<R: HerdrRunner>(
     // in headless agent output can spoof a scrollback-matched sentinel, so
     // completion is detected by polling the result file itself rather than
     // watching the pane.
-    let quoted_log = protocol::shell_quote(&log_file.to_string_lossy());
-    let cd = if reused {
-        format!("cd {} && ", protocol::shell_quote(&cwd))
-    } else {
-        String::new()
-    };
-    let quoted_marker = protocol::shell_quote(&exited_file.to_string_lossy());
-    // `; touch` stays outside the `cd && ...` chain so a failed cd still
-    // leaves the marker.
-    let command = format!("{cd}{base} 2>&1 | tee {quoted_log}; touch {quoted_marker}");
+    let command = protocol::pane_command(
+        reused.then_some(cwd.as_str()),
+        &base,
+        &log_file.to_string_lossy(),
+        &exited_file.to_string_lossy(),
+    );
     runner.run(&pane_id, &command)?;
 
     let tail = protocol::bound_output;
     let mut result = match poll_headless(
-        &result_file, &exited_file, opts.task_id, opts.timeout_ms, opts.exit_grace_ms,
+        runner, &pane_id, &result_file, &exited_file, opts.task_id, opts.timeout_ms, opts.exit_grace_ms,
     ) {
         HeadlessOutcome::Done { text, exited } => {
             let mut r = mk("done", "file", text);
@@ -417,6 +447,12 @@ mod tests {
         split_calls: RefCell<u32>,
         split_cwd: RefCell<Option<String>>,
         pane_exists_result: bool,
+        /// from this `pane_exists` call on (1-based), the pane is gone
+        pane_gone_from_call: Option<u32>,
+        pane_exists_errors: bool,
+        /// the agent completes its result just as the pane goes away
+        completes_as_pane_goes: bool,
+        pane_exists_calls: RefCell<u32>,
         commands: RefCell<Vec<String>>,
         exits: bool,
         log_text: String,
@@ -474,7 +510,20 @@ mod tests {
             self.closed.borrow_mut().push(pane.into()); Ok(())
         }
         fn tab_create(&self, _w: &str, _l: &str) -> anyhow::Result<String> { Ok("{}".into()) }
-        fn pane_exists(&self, _pane: &str) -> anyhow::Result<bool> { Ok(self.pane_exists_result) }
+        fn pane_exists(&self, _pane: &str) -> anyhow::Result<bool> {
+            *self.pane_exists_calls.borrow_mut() += 1;
+            if self.pane_exists_errors {
+                anyhow::bail!("herdr unreachable");
+            }
+            if self.pane_gone_from_call.is_some_and(|n| *self.pane_exists_calls.borrow() >= n) {
+                if self.completes_as_pane_goes {
+                    let content = format!("{}\n{}", self.result_text, protocol::sentinel(&self.task_id));
+                    std::fs::write(result_path(&self.scratch, &self.task_id), content).unwrap();
+                }
+                return Ok(false);
+            }
+            Ok(self.pane_exists_result)
+        }
     }
 
     fn opts<'a>(scratch: &'a std::path::Path, task_id: &'a str) -> DispatchOpts<'a> {
@@ -497,6 +546,8 @@ mod tests {
             scratch: scratch.to_path_buf(), task_id: task_id.into(),
             closed: RefCell::new(vec![]), run_calls: RefCell::new(0),
             split_calls: RefCell::new(0), split_cwd: RefCell::new(None), pane_exists_result: true,
+            pane_gone_from_call: None, pane_exists_errors: false, completes_as_pane_goes: false,
+            pane_exists_calls: RefCell::new(0),
             commands: RefCell::new(vec![]),
             exits: false,
             log_text: "session id: 11111111-2222-3333-4444-555555555555\nwork output\n".into(),
@@ -628,9 +679,17 @@ mod tests {
         assert_eq!(commands.len(), 1);
         let log_file = protocol::log_path(&dir, "rev-tee");
         let quoted_log = format!("'{}'", log_file.to_string_lossy());
-        assert!(commands[0].contains("| tee "), "command was: {}", commands[0]);
-        assert!(commands[0].contains(&quoted_log), "command was: {}", commands[0]);
+        let inner = script(&commands[0]);
+        assert!(inner.contains("| tee "), "command was: {}", commands[0]);
+        assert!(inner.contains(&quoted_log), "command was: {}", commands[0]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The script a pane command hands to `sh -c`, with one quoting level removed.
+    fn script(command: &str) -> String {
+        let body = command.strip_prefix("sh -c '").unwrap_or_else(|| panic!("was: {command}"));
+        let end = body.rfind("' sh '").unwrap_or_else(|| panic!("was: {command}"));
+        body[..end].replace(r"'\''", "'")
     }
 
     fn numbered(n: usize) -> String {
@@ -645,10 +704,12 @@ mod tests {
         let r = fake(&dir, "rev-touch", WriteMode::Complete, "ok");
         dispatch(&r, &default_config(), &opts(&dir, "rev-touch")).unwrap();
         let marker = protocol::exited_path(&dir, "rev-touch");
-        let want = format!("; touch '{}'", marker.to_string_lossy());
+        let want = format!(" sh '{}'", marker.to_string_lossy());
         let commands = r.commands.borrow();
         assert!(commands[0].ends_with(&want), "command was: {}", commands[0]);
-        assert!(commands[0].find("| tee ").unwrap() < commands[0].find("; touch").unwrap());
+        // The trap is set before the pipeline starts, so it covers the whole run.
+        let inner = script(&commands[0]);
+        assert!(inner.find(r#"trap 'touch "$1"' EXIT"#).unwrap() < inner.find("| tee ").unwrap(), "was: {inner}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -835,6 +896,104 @@ mod tests {
     }
 
     #[test]
+    fn pane_gone_without_result_is_failed_and_exited() {
+        let dir = tdir("hd-orch-gone");
+        let mut r = fake(&dir, "rev-g", WriteMode::Nothing, "");
+        r.pane_gone_from_call = Some(1);
+        r.log_text = "the last words\n".into();
+        let mut o = opts(&dir, "rev-g");
+        o.timeout_ms = 1500;
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(out.status, "failed");
+        assert_eq!(out.result_source, "log");
+        assert_eq!(out.result_text, "the last words");
+        assert!(out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pane_gone_with_partial_file_is_failed_from_the_file() {
+        let dir = tdir("hd-orch-gone-partial");
+        let mut r = fake(&dir, "rev-gp", WriteMode::Incomplete, "half done");
+        r.pane_gone_from_call = Some(1);
+        let mut o = opts(&dir, "rev-gp");
+        o.timeout_ms = 1500;
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(out.status, "failed");
+        assert_eq!(out.result_source, "file");
+        assert_eq!(out.result_text, "half done");
+        assert!(out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pane_going_away_later_in_the_run_is_noticed() {
+        let dir = tdir("hd-orch-gone-later");
+        let mut r = fake(&dir, "rev-gl", WriteMode::Nothing, "");
+        r.pane_gone_from_call = Some(2);
+        let mut o = opts(&dir, "rev-gl");
+        o.timeout_ms = 3000;
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(out.status, "failed");
+        assert!(out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn result_completed_as_the_pane_goes_is_done() {
+        let dir = tdir("hd-orch-gone-done");
+        let mut r = fake(&dir, "rev-gd", WriteMode::Nothing, "made it");
+        r.pane_gone_from_call = Some(1);
+        r.completes_as_pane_goes = true;
+        let mut o = opts(&dir, "rev-gd");
+        o.timeout_ms = 1500;
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(out.status, "done");
+        assert_eq!(out.result_text, "made it");
+        assert!(out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pane_gone_during_the_grace_wait_counts_as_exited() {
+        let dir = tdir("hd-orch-gone-grace");
+        let mut r = fake(&dir, "rev-gg", WriteMode::Complete, "fine");
+        r.pane_gone_from_call = Some(1);
+        let mut o = opts(&dir, "rev-gg");
+        o.exit_grace_ms = 1500;
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(out.status, "done");
+        assert!(out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pane_exists_error_does_not_count_as_gone() {
+        let dir = tdir("hd-orch-pane-err");
+        let mut r = fake(&dir, "rev-pe", WriteMode::Nothing, "");
+        r.pane_exists_errors = true;
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-pe")).unwrap();
+        assert_eq!(out.status, "timeout");
+        assert!(!out.agent_exited);
+        assert!(*r.pane_exists_calls.borrow() >= 1, "polling never checked the pane");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pane_exists_error_during_the_grace_wait_is_not_an_exit() {
+        let dir = tdir("hd-orch-pane-err-grace");
+        let mut r = fake(&dir, "rev-peg", WriteMode::Complete, "fine");
+        r.pane_exists_errors = true;
+        let mut o = opts(&dir, "rev-peg");
+        o.exit_grace_ms = 200;
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(out.status, "done");
+        assert!(!out.agent_exited);
+        assert!(*r.pane_exists_calls.borrow() >= 1, "grace wait never checked the pane");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn result_reports_log_file_path() {
         let dir = std::env::temp_dir().join("hd-orch-logpath");
         std::fs::remove_dir_all(&dir).ok();
@@ -919,7 +1078,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
         let prompt_file = protocol::prompt_path(&dir, "rev-quote");
         let quoted_prompt = format!("'{}'", prompt_file.to_string_lossy());
-        assert!(commands[0].contains(&quoted_prompt));
+        assert!(script(&commands[0]).contains(&quoted_prompt));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1025,7 +1184,7 @@ mod tests {
         o.effort = Some("high");
         dispatch(&r, &default_config(), &o).unwrap();
         let commands = r.commands.borrow();
-        assert!(commands[0].contains("--effort 'high'"), "was: {}", commands[0]);
+        assert!(script(&commands[0]).contains("--effort 'high'"), "was: {}", commands[0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1064,7 +1223,8 @@ mod tests {
         let cwd = r.split_cwd.borrow().clone().unwrap();
         assert!(std::path::Path::new(&cwd).is_absolute(), "was: {cwd}");
         let commands = r.commands.borrow();
-        let prompt_arg = commands[0].split('\'').nth(1).unwrap();
+        let inner = script(&commands[0]);
+        let prompt_arg = inner.split("cat '").nth(1).unwrap().split('\'').next().unwrap();
         assert!(std::path::Path::new(prompt_arg).is_absolute(), "was: {prompt_arg}");
         let prompt = std::fs::read_to_string(scratch_abs.join("rel-1.prompt.md")).unwrap();
         let result_line = prompt.lines().find(|l| l.contains("rel-1.result.md")).unwrap();
@@ -1094,7 +1254,8 @@ mod tests {
         dispatch(&r, &default_config(), &o).unwrap();
         let commands = r.commands.borrow();
         let prefix = format!("cd '{}' && ", wt.to_string_lossy());
-        assert!(commands[0].starts_with(&prefix), "was: {}", commands[0]);
+        let inner = script(&commands[0]);
+        assert!(inner.contains(&format!("; {prefix}")), "was: {inner}");
         assert_eq!(*r.split_calls.borrow(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1110,8 +1271,9 @@ mod tests {
         o.resume_session = Some("sess-1");
         dispatch(&r, &default_config(), &o).unwrap();
         let commands = r.commands.borrow();
-        assert!(commands[0].contains("claude -p --resume 'sess-1'"), "was: {}", commands[0]);
-        assert!(commands[0].contains("--model 'opus'"), "was: {}", commands[0]);
+        let inner = script(&commands[0]);
+        assert!(inner.contains("claude -p --resume 'sess-1'"), "was: {inner}");
+        assert!(inner.contains("--model 'opus'"), "was: {inner}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

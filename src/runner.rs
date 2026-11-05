@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 use std::process::Command;
 
@@ -89,15 +89,17 @@ impl<E: CommandExec> HerdrRunner for CliRunner<E> {
         Ok(self.exec.exec(&args, true)?.stdout)
     }
     fn pane_exists(&self, pane: &str) -> Result<bool> {
-        let stdout = self.exec.exec(&[s("pane"), s("list")], true)?.stdout;
-        let parsed: Value = match serde_json::from_str(&stdout) {
-            Ok(v) => v,
-            Err(_) => return Ok(false),
-        };
-        let panes = match parsed.get("result").and_then(|r| r.get("panes")).and_then(|p| p.as_array()) {
-            Some(panes) => panes,
-            None => return Ok(false),
-        };
+        // Ok(false) must mean herdr said the pane is gone, so anything else is an error.
+        let out = self.exec.exec(&[s("pane"), s("list")], true)?;
+        if out.code != 0 {
+            bail!("herdr pane list exited with code {}", out.code);
+        }
+        let parsed: Value = serde_json::from_str(&out.stdout)?;
+        let panes = parsed
+            .get("result")
+            .and_then(|r| r.get("panes"))
+            .and_then(|p| p.as_array())
+            .ok_or_else(|| anyhow!("herdr pane list gave no panes: {}", out.stdout))?;
         Ok(panes.iter().any(|p| p.get("pane_id").and_then(|id| id.as_str()) == Some(pane)))
     }
 }
@@ -182,6 +184,14 @@ mod tests {
             r.exec.calls.borrow()[0].0,
             vec!["tab","create","--workspace","1","--label","workers"]
         );
+    }
+
+    #[test]
+    fn pane_exists_errors_instead_of_reporting_gone_when_herdr_fails() {
+        assert!(CliRunner::new(rec("", 1)).pane_exists("w1:p1").is_err());
+        assert!(CliRunner::new(rec("not json", 0)).pane_exists("w1:p1").is_err());
+        assert!(CliRunner::new(rec(r#"{"error":{"code":"x"}}"#, 0)).pane_exists("w1:p1").is_err());
+        assert!(CliRunner::new(rec(r#"{"result":{"panes":[{"pane_id":"w1:p1"}]}}"#, 1)).pane_exists("w1:p1").is_err());
     }
 
     #[test]
