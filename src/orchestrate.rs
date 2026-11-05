@@ -28,6 +28,7 @@ pub struct DispatchOpts<'a> {
     pub effort: Option<&'a str>,
     pub resume_session: Option<&'a str>,
     pub cwd: Option<&'a str>,
+    pub exit_grace_ms: u64,
 }
 
 #[derive(Serialize, Debug)]
@@ -40,6 +41,8 @@ pub struct DispatchResult {
     pub result_source: String,
     pub result_text: String,
     pub session_id: Option<String>,
+    pub log_file: String,
+    pub agent_exited: bool,
 }
 
 fn record(
@@ -77,6 +80,64 @@ fn poll_result_file(result_file: &Path, task_id: &str, timeout_ms: u64) -> Optio
         }
         if Instant::now() >= deadline {
             return None;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+const OUTPUT_TAIL_LINES: usize = 40;
+
+enum HeadlessOutcome {
+    /// Complete result and whether the exit marker showed up within the grace.
+    Done { text: String, exited: bool },
+    /// Exit marker present but no complete result.
+    Exited,
+    Deadline,
+}
+
+fn read_complete(result_file: &Path, task_id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(result_file).ok()?;
+    protocol::extract_complete_result(&text, task_id)
+}
+
+/// Wait up to `grace_ms` for the exit marker (always checks at least once).
+fn marker_within_grace(marker: &Path, grace_ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(grace_ms);
+    loop {
+        if marker.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Poll for a complete result, the agent-exit marker, or the deadline.
+fn poll_headless(
+    result_file: &Path,
+    marker: &Path,
+    task_id: &str,
+    timeout_ms: u64,
+    grace_ms: u64,
+) -> HeadlessOutcome {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let poll = Duration::from_millis(200);
+    loop {
+        if let Some(text) = read_complete(result_file, task_id) {
+            let exited = marker_within_grace(marker, grace_ms);
+            return HeadlessOutcome::Done { text, exited };
+        }
+        if marker.exists() {
+            // The agent may have finished between the two reads.
+            return match read_complete(result_file, task_id) {
+                Some(text) => HeadlessOutcome::Done { text, exited: true },
+                None => HeadlessOutcome::Exited,
+            };
+        }
+        if Instant::now() >= deadline {
+            return HeadlessOutcome::Deadline;
         }
         std::thread::sleep(poll);
     }
@@ -125,6 +186,7 @@ pub fn dispatch<R: HerdrRunner>(
     let prompt_file = protocol::prompt_path(&scratch, opts.task_id);
     let result_file = protocol::result_path(&scratch, opts.task_id);
     let log_file = protocol::log_path(&scratch, opts.task_id);
+    let exited_file = protocol::exited_path(&scratch, opts.task_id);
     let base_command = if opts.interactive {
         None
     } else {
@@ -146,6 +208,8 @@ pub fn dispatch<R: HerdrRunner>(
     // A prior run with the same task_id may have left a log behind; clear it
     // so id capture can only ever read this run's agent output.
     let _ = std::fs::remove_file(&log_file);
+    // A stale exit marker would make this run look like it already exited.
+    let _ = std::fs::remove_file(&exited_file);
     std::fs::write(
         &prompt_file,
         protocol::build_prompt(opts.context, opts.task_id, &result_file.to_string_lossy(), opts.role),
@@ -153,7 +217,7 @@ pub fn dispatch<R: HerdrRunner>(
     record(opts, &vendor, "", "dispatched", &created_at, None, &cwd);
 
     let Some(base) = base_command else {
-        return dispatch_interactive(runner, spec, opts, &vendor, &prompt_file, &result_file, &created_at, &cwd);
+        return dispatch_interactive(runner, spec, opts, &vendor, &prompt_file, &result_file, &log_file, &created_at, &cwd);
     };
 
     let mut reused = false;
@@ -171,6 +235,7 @@ pub fn dispatch<R: HerdrRunner>(
         status: status.into(), task_id: opts.task_id.into(), vendor: vendor.clone(),
         pane_id: pane_id.clone(), result_file: result_file.to_string_lossy().into(),
         result_source: source.into(), result_text: text, session_id: None,
+        log_file: log_file.to_string_lossy().into(), agent_exited: false,
     };
 
     record(opts, &vendor, &pane_id, "working", &created_at, None, &cwd);
@@ -186,18 +251,37 @@ pub fn dispatch<R: HerdrRunner>(
     } else {
         String::new()
     };
-    let command = format!("{cd}{base} 2>&1 | tee {quoted_log}");
+    let quoted_marker = protocol::shell_quote(&exited_file.to_string_lossy());
+    // `; touch` stays outside the `cd && ...` chain so a failed cd still
+    // leaves the marker.
+    let command = format!("{cd}{base} 2>&1 | tee {quoted_log}; touch {quoted_marker}");
     runner.run(&pane_id, &command)?;
 
-    let completed = poll_result_file(&result_file, opts.task_id, opts.timeout_ms);
-
-    let mut result = match completed {
-        Some(text) => mk("done", "file", text),
-        None => {
+    let tail = |t: &str| protocol::tail_lines(t, OUTPUT_TAIL_LINES);
+    let mut result = match poll_headless(
+        &result_file, &exited_file, opts.task_id, opts.timeout_ms, opts.exit_grace_ms,
+    ) {
+        HeadlessOutcome::Done { text, exited } => {
+            let mut r = mk("done", "file", text);
+            r.agent_exited = exited;
+            r
+        }
+        HeadlessOutcome::Exited => {
+            let mut r = match std::fs::read_to_string(&result_file) {
+                Ok(t) => mk("failed", "file", tail(&t)),
+                Err(_) => {
+                    let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+                    mk("failed", "log", tail(&log))
+                }
+            };
+            r.agent_exited = true;
+            r
+        }
+        HeadlessOutcome::Deadline => {
             let scrollback = runner.read(&pane_id, "recent-unwrapped", 200)?;
             match protocol::capture_result(&result_file, Some(&scrollback)) {
-                Capture::File(t) => mk("degraded", "file", t),
-                Capture::Scrollback(t) => mk("timeout", "scrollback", t),
+                Capture::File(t) => mk("degraded", "file", tail(&t)),
+                Capture::Scrollback(t) => mk("timeout", "scrollback", tail(&t)),
                 Capture::Missing => mk("timeout", "scrollback", String::new()),
             }
         }
@@ -229,6 +313,7 @@ fn dispatch_interactive<R: HerdrRunner>(
     vendor: &str,
     prompt_file: &Path,
     result_file: &Path,
+    log_file: &Path,
     created_at: &str,
     cwd: &str,
 ) -> Result<DispatchResult> {
@@ -241,6 +326,7 @@ fn dispatch_interactive<R: HerdrRunner>(
         status: status.into(), task_id: opts.task_id.into(), vendor: vendor.into(),
         pane_id: pane_id.clone(), result_file: result_file.to_string_lossy().into(),
         result_source: source.into(), result_text: text, session_id: None,
+        log_file: log_file.to_string_lossy().into(), agent_exited: false,
     };
 
     // 1. Launch the bare TUI in the target dir with gate-bypass flags.
@@ -334,6 +420,9 @@ mod tests {
         split_cwd: RefCell<Option<String>>,
         pane_exists_result: bool,
         commands: RefCell<Vec<String>>,
+        exits: bool,
+        log_text: String,
+        scrollback: String,
     }
     impl HerdrRunner for FakeRunner {
         fn split(&self, _p: &str, _d: &str, _f: bool, cwd: Option<&str>) -> anyhow::Result<String> {
@@ -360,10 +449,10 @@ mod tests {
                     WriteMode::Nothing => {}
                 }
                 let log = crate::protocol::log_path(&self.scratch, &self.task_id);
-                std::fs::write(
-                    log,
-                    "session id: 11111111-2222-3333-4444-555555555555\nwork output\n",
-                ).unwrap();
+                std::fs::write(log, &self.log_text).unwrap();
+                if self.exits {
+                    std::fs::write(protocol::exited_path(&self.scratch, &self.task_id), "").unwrap();
+                }
             }
             Ok(())
         }
@@ -373,7 +462,7 @@ mod tests {
             Ok(true)
         }
         fn read(&self, _p: &str, _s: &str, _l: u32) -> anyhow::Result<String> {
-            Ok("scrollback".into())
+            Ok(self.scrollback.clone())
         }
         fn close(&self, pane: &str) -> anyhow::Result<()> {
             self.closed.borrow_mut().push(pane.into()); Ok(())
@@ -390,6 +479,7 @@ mod tests {
             close: false, state_dir: None, reuse_pane: None, mode: "headless",
             interactive: false,
             model: None, effort: None, resume_session: None, cwd: None,
+            exit_grace_ms: 0,
         }
     }
 
@@ -402,6 +492,9 @@ mod tests {
             closed: RefCell::new(vec![]), run_calls: RefCell::new(0),
             split_calls: RefCell::new(0), split_cwd: RefCell::new(None), pane_exists_result: true,
             commands: RefCell::new(vec![]),
+            exits: false,
+            log_text: "session id: 11111111-2222-3333-4444-555555555555\nwork output\n".into(),
+            scrollback: "scrollback".into(),
         }
     }
 
@@ -529,6 +622,141 @@ mod tests {
         let quoted_log = format!("'{}'", log_file.to_string_lossy());
         assert!(commands[0].contains("| tee "), "command was: {}", commands[0]);
         assert!(commands[0].contains(&quoted_log), "command was: {}", commands[0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn numbered(n: usize) -> String {
+        (1..=n).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn command_touches_marker_after_tee() {
+        let dir = std::env::temp_dir().join("hd-orch-touch");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = fake(&dir, "rev-touch", WriteMode::Complete, "ok");
+        dispatch(&r, &default_config(), &opts(&dir, "rev-touch")).unwrap();
+        let marker = protocol::exited_path(&dir, "rev-touch");
+        let want = format!("; touch '{}'", marker.to_string_lossy());
+        let commands = r.commands.borrow();
+        assert!(commands[0].ends_with(&want), "command was: {}", commands[0]);
+        assert!(commands[0].find("| tee ").unwrap() < commands[0].find("; touch").unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_marker_is_cleared_before_dispatch() {
+        let dir = std::env::temp_dir().join("hd-orch-stale-marker");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(protocol::exited_path(&dir, "rev-sm"), "").unwrap();
+        let r = fake(&dir, "rev-sm", WriteMode::Nothing, "");
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-sm")).unwrap();
+        assert_eq!(out.status, "timeout");
+        assert!(!out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn result_and_marker_together_is_done() {
+        let dir = std::env::temp_dir().join("hd-orch-both");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = fake(&dir, "rev-both", WriteMode::Complete, "fine");
+        r.exits = true;
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-both")).unwrap();
+        assert_eq!(out.status, "done");
+        assert_eq!(out.result_text, "fine");
+        assert!(out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn done_without_marker_reports_agent_not_exited() {
+        let dir = std::env::temp_dir().join("hd-orch-nomarker");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = fake(&dir, "rev-nm", WriteMode::Complete, "fine");
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-nm")).unwrap();
+        assert_eq!(out.status, "done");
+        assert!(!out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exit_without_result_fails_immediately_with_log_tail() {
+        let dir = std::env::temp_dir().join("hd-orch-exit-nores");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = fake(&dir, "rev-en", WriteMode::Nothing, "");
+        r.exits = true;
+        r.log_text = numbered(100);
+        let mut o = opts(&dir, "rev-en");
+        o.timeout_ms = 60_000;
+        let t = Instant::now();
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert_eq!(out.status, "failed");
+        assert_eq!(out.result_source, "log");
+        assert!(out.agent_exited);
+        assert_eq!(out.result_text.lines().count(), 40);
+        assert!(out.result_text.ends_with("line 100"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exit_with_partial_file_is_failed() {
+        let dir = std::env::temp_dir().join("hd-orch-exit-partial");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = fake(&dir, "rev-ep", WriteMode::Incomplete, "half done");
+        r.exits = true;
+        let mut o = opts(&dir, "rev-ep");
+        o.timeout_ms = 60_000;
+        let out = dispatch(&r, &default_config(), &o).unwrap();
+        assert_eq!(out.status, "failed");
+        assert_eq!(out.result_source, "file");
+        assert_eq!(out.result_text, "half done");
+        assert!(out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn timeout_bounds_scrollback_to_40_lines() {
+        let dir = std::env::temp_dir().join("hd-orch-sb40");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = fake(&dir, "rev-sb", WriteMode::Nothing, "");
+        r.scrollback = numbered(100);
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-sb")).unwrap();
+        assert_eq!(out.status, "timeout");
+        assert_eq!(out.result_text.lines().count(), 40);
+        assert!(out.result_text.ends_with("line 100"));
+        assert!(!out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn degraded_bounds_partial_file_to_40_lines() {
+        let dir = std::env::temp_dir().join("hd-orch-deg40");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = fake(&dir, "rev-d40", WriteMode::Incomplete, &numbered(100));
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-d40")).unwrap();
+        assert_eq!(out.status, "degraded");
+        assert_eq!(out.result_text.lines().count(), 40);
+        assert!(!out.agent_exited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn result_reports_log_file_path() {
+        let dir = std::env::temp_dir().join("hd-orch-logpath");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = fake(&dir, "rev-lp", WriteMode::Complete, "ok");
+        let out = dispatch(&r, &default_config(), &opts(&dir, "rev-lp")).unwrap();
+        assert_eq!(out.log_file, protocol::log_path(&dir, "rev-lp").to_string_lossy());
         std::fs::remove_dir_all(&dir).ok();
     }
 

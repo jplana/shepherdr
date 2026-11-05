@@ -27,6 +27,7 @@ fn status_exit_code(status: &str) -> i32 {
     match status {
         "done" => 0,
         "degraded" => 3,
+        "failed" => 2,
         _ => 2, // timeout or anything unexpected
     }
 }

@@ -16,6 +16,16 @@ pub fn log_path(scratch: &Path, task_id: &str) -> PathBuf {
     scratch.join(format!("{task_id}.log"))
 }
 
+pub fn exited_path(scratch: &Path, task_id: &str) -> PathBuf {
+    scratch.join(format!("{task_id}.exited"))
+}
+
+/// Last `n` lines of `text`; shorter input is returned whole.
+pub fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// Single-quote a path/string for safe inclusion in a shell command.
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
@@ -99,6 +109,18 @@ mod tests {
     #[test]
     fn sentinel_format() {
         assert_eq!(sentinel("rev-1"), "DONE::rev-1");
+    }
+
+    #[test]
+    fn exited_path_names_marker() {
+        assert_eq!(exited_path(Path::new("/s"), "t1"), Path::new("/s/t1.exited"));
+    }
+
+    #[test]
+    fn tail_lines_keeps_last_n() {
+        assert_eq!(tail_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(tail_lines("a\nb", 5), "a\nb");
+        assert_eq!(tail_lines("", 3), "");
     }
 
     #[test]

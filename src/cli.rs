@@ -44,6 +44,8 @@ pub struct DispatchArgs {
     pub cwd: Option<String>,
 }
 
+const EXIT_GRACE_MS: u64 = 30_000;
+
 pub fn run_dispatch<R: HerdrRunner>(args: &DispatchArgs, runner: &R) -> Result<DispatchResult> {
     let context = std::fs::read_to_string(&args.context_file)?;
     let unavailable = args.unavailable.split(',').filter(|s| !s.is_empty())
@@ -68,6 +70,7 @@ pub fn run_dispatch<R: HerdrRunner>(args: &DispatchArgs, runner: &R) -> Result<D
         effort: args.effort.as_deref(),
         resume_session: args.resume_session.as_deref(),
         cwd: args.cwd.as_deref(),
+        exit_grace_ms: EXIT_GRACE_MS,
     };
     dispatch(runner, &default_config(), &opts)
 }
