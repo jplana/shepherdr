@@ -120,6 +120,7 @@ mod tests {
                 // its trailing sentinel line, so the stub must write one
                 let content = format!("no findings\n{}", crate::protocol::sentinel(&self.task_id));
                 std::fs::write(result_path(&self.scratch, &self.task_id), content).unwrap();
+                std::fs::write(crate::protocol::exited_path(&self.scratch, &self.task_id), "").unwrap();
             }
             Ok(())
         }
@@ -219,6 +220,7 @@ mod tests {
         assert_eq!(out.status, "done");
         assert_eq!(out.result_text, "no findings");
         assert_eq!(out.pane_id, "9-9");
+        assert!(out.agent_exited);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
