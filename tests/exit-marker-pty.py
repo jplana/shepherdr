@@ -40,6 +40,7 @@ AGENT_STUB = """#!/bin/sh
 stub_dir="$(dirname "$0")"
 if [ -t 0 ]; then printf '%s' "$*" > "$stub_dir/agent.stdin"; else cat > "$stub_dir/agent.stdin"; fi
 echo '{"type":"system","session_id":"stub-session"}'
+printf '%s' "$CLAUDE_CONFIG_DIR" > "$stub_dir/agent.config"
 echo $$ > "$stub_dir/agent.pid"
 case "$STUB_AGENT" in
   exit0) exit 0 ;;
@@ -68,8 +69,9 @@ class Fixture:
         write_stub(os.path.join(self.stubs, "claude"), AGENT_STUB)
         self.pid_file = os.path.join(self.stubs, "agent.pid")
         self.stdin_file = os.path.join(self.stubs, "agent.stdin")
+        self.config_file = os.path.join(self.stubs, "agent.config")
 
-    def pane_command(self, task_id, reuse, headless=True):
+    def pane_command(self, task_id, reuse, headless=True, config_dir=None):
         """Ask the real binary for the command it would send to the pane."""
         command_file = os.path.join(self.base, "command")
         context = os.path.join(self.scratch, f"{task_id}.context.md")
@@ -86,7 +88,12 @@ class Fixture:
         if reuse:
             args += ["--reuse-pane", "stub:p9"]
         env = dict(os.environ, HERDR_BIN_PATH=os.path.join(self.stubs, "herdr"),
-                   STUB_COMMAND_FILE=command_file)
+                   STUB_COMMAND_FILE=command_file,
+                   # Without this, these fake dispatches land on the real board.
+                   HERDR_PLUGIN_STATE_DIR=os.path.join(self.base, "state"))
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        if config_dir:
+            env["CLAUDE_CONFIG_DIR"] = config_dir
         subprocess.run(args, env=env, capture_output=True, cwd=self.base)
         with open(command_file) as f:
             return f.read()
@@ -97,6 +104,8 @@ class Pane:
 
     def __init__(self, argv, fixture, agent_mode):
         env = dict(os.environ, STUB_AGENT=agent_mode, PS1="prompt> ", TERM="dumb")
+        # A new herdr pane doesn't inherit the caller's value, so neither does this one.
+        env.pop("CLAUDE_CONFIG_DIR", None)
         env.pop("ENV", None)
         env.pop("BASH_ENV", None)
         self.pid, self.fd = pty.fork()
@@ -294,6 +303,28 @@ def run_term_to_wrapper_only(fixture, shell, argv, headless):
         pane.destroy()
 
 
+def run_config_dir(fixture, shell, argv, headless):
+    """The caller's CLAUDE_CONFIG_DIR reaches an agent in a pane that doesn't have it."""
+    task_id = f"{shell}-config-{'headless' if headless else 'real'}"
+    wanted = os.path.join(fixture.base, "my config it's")
+    command = fixture.pane_command(task_id, reuse=False, headless=headless, config_dir=wanted)
+    marker = os.path.join(fixture.scratch, f"{task_id}.exited")
+    if os.path.exists(fixture.config_file):
+        os.remove(fixture.config_file)
+    pane = Pane(argv, fixture, "exit0")
+    try:
+        pane.send(command + "\n")
+        if not pane.wait_path(marker):
+            return ["no marker"]
+        if not os.path.exists(fixture.config_file):
+            return ["agent never ran"]
+        with open(fixture.config_file) as f:
+            seen = f.read()
+        return [] if seen == wanted else [f"agent saw {seen!r}"]
+    finally:
+        pane.destroy()
+
+
 def main():
     if not os.access(BIN, os.X_OK):
         print("BLOCKED: build first (cargo build)")
@@ -317,6 +348,8 @@ def main():
                 for number, (name, mode, action) in enumerate(CASES):
                     report(shell, f"{kind}: {name}",
                            run_case(fixture, shell, argv, name, mode, action, number, headless))
+                report(shell, f"{kind}: caller's CLAUDE_CONFIG_DIR reaches the agent",
+                       run_config_dir(fixture, shell, argv, headless))
                 report(shell, f"{kind}: reuse-pane cd fails", run_failed_cd(fixture, shell, argv, headless))
                 report(shell, f"{kind}: SIGTERM to the wrapper alone waits for the agent",
                        run_term_to_wrapper_only(fixture, shell, argv, headless))

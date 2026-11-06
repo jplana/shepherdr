@@ -19,6 +19,9 @@ pub struct DispatchRecord {
     pub cwd: String,
     #[serde(default)]
     pub created_at: String,
+    /// The `CLAUDE_CONFIG_DIR` a claude agent ran under, because its session lives there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -114,7 +117,7 @@ mod tests {
             task_id: id.into(), role: "reviewer".into(), vendor: "codex".into(),
             pane_id: "1-3".into(), status: status.into(),
             session_id: None, mode: "headless".into(),
-            cwd: String::new(), created_at: String::new(),
+            cwd: String::new(), created_at: String::new(), claude_config_dir: None,
         }
     }
 
@@ -123,8 +126,15 @@ mod tests {
             task_id: id.into(), role: "reviewer".into(), vendor: "codex".into(),
             pane_id: "1-3".into(), status: status.into(),
             session_id: session_id.map(String::from), mode: "headless".into(),
-            cwd: "/wt".into(), created_at: created_at.into(),
+            cwd: "/wt".into(), created_at: created_at.into(), claude_config_dir: None,
         }
+    }
+
+    #[test]
+    fn a_record_written_before_config_dirs_were_saved_still_reads() {
+        let old = r#"{"task_id":"t","role":"implementer","vendor":"claude","pane_id":"p","status":"done"}"#;
+        let rec: DispatchRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(rec.claude_config_dir, None);
     }
 
     #[test]
