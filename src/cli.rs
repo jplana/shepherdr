@@ -59,6 +59,7 @@ pub fn run_dispatch<R: HerdrRunner>(args: &DispatchArgs, runner: &R) -> Result<D
     let unavailable = args.unavailable.split(',').filter(|s| !s.is_empty())
         .map(String::from).collect();
     let state_dir = args.state_dir.as_deref().map(Path::new);
+    let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok().filter(|dir| !dir.is_empty());
     let opts = DispatchOpts {
         context: &context,
         role: &args.role,
@@ -80,6 +81,7 @@ pub fn run_dispatch<R: HerdrRunner>(args: &DispatchArgs, runner: &R) -> Result<D
         effort: args.effort.as_deref(),
         resume_session: args.resume_session.as_deref(),
         cwd: args.cwd.as_deref(),
+        claude_config_dir: claude_config_dir.as_deref(),
         exit_grace_ms: EXIT_GRACE_MS,
     };
     dispatch(runner, &default_config(), &opts)
@@ -106,7 +108,7 @@ pub fn run_resume<R: HerdrRunner>(args: &ResumeArgs, runner: &R) -> Result<Strin
     let session_id = record.session_id.as_deref().ok_or_else(|| {
         anyhow!("no captured session id for {} — cannot resume", args.task_id)
     })?;
-    let command = session::resume_command(&record.vendor, session_id, &record.cwd)?;
+    let command = session::resume_command(&record.vendor, session_id, &record.cwd, record.claude_config_dir.as_deref())?;
     let pane_id = protocol::pane_id_from_split(
         &runner.split(&args.from_pane, &args.split_direction, true, None)?,
     )?;
@@ -169,7 +171,7 @@ mod tests {
             task_id: task_id.into(), role: "reviewer".into(), vendor: "codex".into(),
             pane_id: "1-3".into(), status: "done".into(),
             session_id: session_id.map(String::from), mode: "headless".into(),
-            cwd: "/repo/wt".into(), created_at: "1".into(),
+            cwd: "/repo/wt".into(), created_at: "1".into(), claude_config_dir: None,
         }
     }
 
@@ -191,6 +193,28 @@ mod tests {
         assert!(cmd.contains("cd '/repo/wt' &&"), "was: {cmd}");
         assert!(cmd.contains("codex resume 'sess-1'"), "was: {cmd}");
         assert!(!cmd.contains("--dangerously"), "was: {cmd}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_resume_reopens_a_claude_session_under_the_config_it_ran_in() {
+        let dir = std::env::temp_dir().join("hd-resume-config");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = DispatchRecord {
+            vendor: "claude".into(),
+            claude_config_dir: Some("/home/me/.jclaude".into()),
+            ..resumable_record("t1", Some("sess-1"))
+        };
+        write_record(&dir, &record).unwrap();
+        let args = ResumeArgs {
+            task_id: "t1".into(), state_dir: dir.to_string_lossy().into(),
+            from_pane: "1-2".into(), split_direction: "right".into(),
+        };
+        let fake = ResumeFake { commands: RefCell::new(vec![]), split_focus: RefCell::new(vec![]) };
+        run_resume(&args, &fake).unwrap();
+        let cmd = &fake.commands.borrow()[0];
+        assert!(cmd.contains("env CLAUDE_CONFIG_DIR='/home/me/.jclaude' claude --resume 'sess-1'"), "was: {cmd}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

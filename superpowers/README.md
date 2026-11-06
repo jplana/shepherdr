@@ -34,6 +34,8 @@ A herdr call that takes longer than 10 seconds counts as a herdr error. While wa
 
 5. Run Claude Code inside a herdr session (`HERDR_ENV=1`).
 
+If you also run Claude with another config, such as `CLAUDE_CONFIG_DIR=~/.other claude`, repeat steps 2 to 4 for it, using `~/.other` in place of `~/.claude`. Each config has its own plugins, skills, CLAUDE.md and folder trust, and its agents run under the same config.
+
 Upgrading from an older shepherdr: remove its overlay symlinks from `~/.claude/skills/` (every `*-herdr` link except `dispatching-implementers-to-herdr`) and delete the old herdr block from your CLAUDE.md, which the block above replaces.
 
 ## Manual tools

@@ -361,7 +361,7 @@ mod tests {
             vendor: None, unavailable: Default::default(), timeout_ms: 60_000,
             split_direction: "right", placement: "split", keep_open: true, headless: false, state_dir: None, reuse_pane: None,
             mode: "headless", interactive: false, model: None, effort: None,
-            resume_session: None, cwd: None, exit_grace_ms: 500,
+            resume_session: None, cwd: None, claude_config_dir: None, exit_grace_ms: 500,
         };
         let start = std::time::Instant::now();
         let out = crate::orchestrate::dispatch(&runner, &crate::config::default_config(), &opts).unwrap();

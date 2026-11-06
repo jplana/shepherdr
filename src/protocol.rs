@@ -105,6 +105,11 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// The start of a command that runs claude under `config_dir`, or nothing without one.
+pub fn claude_env(config_dir: Option<&str>) -> String {
+    config_dir.map_or(String::new(), |dir| format!("env CLAUDE_CONFIG_DIR={} ", shell_quote(dir)))
+}
+
 /// The command typed into an agent's pane. `clear` removes the typed command from
 /// view. `log_file` is for headless agents only, because piping would stop the real
 /// interface from running in a terminal. It runs under its own `sh`,

@@ -107,12 +107,12 @@ fn find_string_key(value: &Value, keys: &[&str]) -> Option<String> {
 /// Build the plain (non-bypass) resume command for a vendor, run in `cwd`.
 /// Per the trust-posture-at-launch policy, this carries NO autonomy flags:
 /// the human is present and approves tool calls in the resumed session.
-pub fn resume_command(vendor: &str, session_id: &str, cwd: &str) -> Result<String> {
+pub fn resume_command(vendor: &str, session_id: &str, cwd: &str, claude_config_dir: Option<&str>) -> Result<String> {
     let id = shell_quote(session_id);
     let dir = shell_quote(cwd);
     let resume = match vendor {
         "codex" => format!("codex resume {id}"),
-        "claude" => format!("claude --resume {id}"),
+        "claude" => format!("{}claude --resume {id}", crate::protocol::claude_env(claude_config_dir)),
         "cursor" => format!("cursor-agent --resume {id}"),
         other => return Err(anyhow!("cannot resume unknown vendor: {other}")),
     };
@@ -206,21 +206,21 @@ mod tests {
 
     #[test]
     fn resume_command_per_vendor_cds_and_resumes() {
-        let codex = resume_command("codex", "id-1", "/repo/wt").unwrap();
+        let codex = resume_command("codex", "id-1", "/repo/wt", None).unwrap();
         assert!(codex.contains("cd '/repo/wt' &&"), "was: {codex}");
         assert!(codex.contains("codex resume 'id-1'"), "was: {codex}");
 
-        let claude = resume_command("claude", "id-2", "/repo/wt").unwrap();
+        let claude = resume_command("claude", "id-2", "/repo/wt", None).unwrap();
         assert!(claude.contains("claude --resume 'id-2'"), "was: {claude}");
 
-        let cursor = resume_command("cursor", "id-3", "/repo/wt").unwrap();
+        let cursor = resume_command("cursor", "id-3", "/repo/wt", None).unwrap();
         assert!(cursor.contains("cursor-agent --resume 'id-3'"), "was: {cursor}");
     }
 
     #[test]
     fn resume_command_omits_all_autonomy_flags() {
         for vendor in ["codex", "claude", "cursor"] {
-            let cmd = resume_command(vendor, "id", "/wt").unwrap();
+            let cmd = resume_command(vendor, "id", "/wt", None).unwrap();
             assert!(!cmd.contains("--dangerously"), "{vendor}: {cmd}");
             assert!(!cmd.contains("--force"), "{vendor}: {cmd}");
             assert!(!cmd.contains("bypass"), "{vendor}: {cmd}");
@@ -229,7 +229,21 @@ mod tests {
     }
 
     #[test]
+    fn a_hostile_config_dir_stays_one_word_in_the_claude_resume_command() {
+        let cmd = resume_command("claude", "id", "/wt", Some("/a b'; touch x")).unwrap();
+        assert!(cmd.contains(r"env CLAUDE_CONFIG_DIR='/a b'\''; touch x' claude --resume 'id'"), "was: {cmd}");
+    }
+
+    #[test]
+    fn only_claude_resume_commands_carry_the_config_dir() {
+        for vendor in ["codex", "cursor"] {
+            let cmd = resume_command(vendor, "id", "/wt", Some("/cfg")).unwrap();
+            assert!(!cmd.contains("CLAUDE_CONFIG_DIR"), "{vendor}: {cmd}");
+        }
+    }
+
+    #[test]
     fn resume_command_rejects_unknown_vendor() {
-        assert!(resume_command("nope", "id", "/wt").is_err());
+        assert!(resume_command("nope", "id", "/wt", None).is_err());
     }
 }

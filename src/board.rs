@@ -42,7 +42,7 @@ mod tests {
             task_id: id.into(), role: "reviewer".into(), vendor: "codex".into(),
             pane_id: "1-3".into(), status: status.into(),
             session_id: None, mode: "headless".into(),
-            cwd: String::new(), created_at: String::new(),
+            cwd: String::new(), created_at: String::new(), claude_config_dir: None,
         }
     }
 
@@ -56,7 +56,7 @@ mod tests {
             task_id: id.into(), role: "reviewer".into(), vendor: "codex".into(),
             pane_id: "1-3".into(), status: "done".into(),
             session_id: session_id.map(String::from), mode: "headless".into(),
-            cwd: String::new(), created_at: String::new(),
+            cwd: String::new(), created_at: String::new(), claude_config_dir: None,
         }
     }
 

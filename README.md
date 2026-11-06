@@ -30,6 +30,10 @@ herdr and your shell both run `shepherdr` by name. If `~/.cargo/bin` isn't on th
 
 After pulling changes, run `cargo install --path .` again. Keep the clone in place, because the plugin link points into it.
 
+### If you use more than one Claude config
+
+`shepherdr dispatch` passes its caller's `CLAUDE_CONFIG_DIR` to a claude agent, so an agent started from `CLAUDE_CONFIG_DIR=~/.other claude` uses that config's login and settings, including when you resume it. Set up the Superpowers integration once per config, as [`superpowers/README.md`](superpowers/README.md) describes.
+
 ## The dispatch CLI
 
 ```

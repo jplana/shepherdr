@@ -31,6 +31,8 @@ pub struct DispatchOpts<'a> {
     pub effort: Option<&'a str>,
     pub resume_session: Option<&'a str>,
     pub cwd: Option<&'a str>,
+    /// The caller's `CLAUDE_CONFIG_DIR`. A new pane doesn't inherit the caller's environment.
+    pub claude_config_dir: Option<&'a str>,
     pub exit_grace_ms: u64,
 }
 
@@ -67,8 +69,14 @@ fn record(
             mode: opts.mode.into(),
             cwd,
             created_at: created_at.into(),
+            claude_config_dir: claude_config_dir(opts, vendor).map(String::from),
         });
     }
+}
+
+/// The config dir that applies to this agent. Only claude reads it.
+fn claude_config_dir<'a>(opts: &DispatchOpts<'a>, vendor: &str) -> Option<&'a str> {
+    opts.claude_config_dir.filter(|_| vendor == "claude")
 }
 
 /// Poll the result file until its trailing sentinel appears or the deadline
@@ -432,6 +440,11 @@ pub fn dispatch<R: HerdrRunner>(
     // in headless agent output can spoof a scrollback-matched sentinel, so
     // completion is detected by polling the result file itself rather than
     // watching the pane.
+    // Ahead of the whole command, because a headless one starts with `cat`, not the agent.
+    let base = match claude_config_dir(opts, &vendor) {
+        Some(dir) => format!("export CLAUDE_CONFIG_DIR={} && {base}", protocol::shell_quote(dir)),
+        None => base,
+    };
     let command = protocol::pane_command(
         reused.then_some(cwd.as_str()),
         &base,
@@ -559,7 +572,12 @@ fn dispatch_interactive<R: HerdrRunner>(
     };
 
     // 1. Launch the bare TUI in the target dir with gate-bypass flags.
-    let launch = format!("cd {} && {}", protocol::shell_quote(cwd), spec.interactive_command);
+    let launch = format!(
+        "cd {} && {}{}",
+        protocol::shell_quote(cwd),
+        protocol::claude_env(claude_config_dir(opts, vendor)),
+        spec.interactive_command,
+    );
     runner.run(&pane_id, &launch)?;
 
     // 2. Poll `read --source visible` for readiness (cue if set, else any
@@ -770,7 +788,7 @@ mod tests {
             timeout_ms: 400, split_direction: "right",
             placement: "split", keep_open: true, headless: false, state_dir: None, reuse_pane: None, mode: "headless",
             interactive: false,
-            model: None, effort: None, resume_session: None, cwd: None,
+            model: None, effort: None, resume_session: None, cwd: None, claude_config_dir: None,
             exit_grace_ms: 0,
         }
     }
@@ -2008,6 +2026,91 @@ mod tests {
         assert_eq!(*r.split_calls.borrow(), 1);
         assert!(r.split_cwd.borrow().is_some());
         assert!(r.commands.borrow()[0].contains("--resume"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_claude_agent_runs_under_the_callers_config_dir() {
+        for (name, headless, resume) in [
+            ("hd-orch-config-tui", false, None),
+            ("hd-orch-config-tui-resume", false, Some("sess-1")),
+            ("hd-orch-config-headless", true, None),
+        ] {
+            let dir = tdir(name);
+            let mut r = fake(&dir, "t", WriteMode::Complete, "ok");
+            r.turn_end = Some(TURN_ENDED.into());
+            r.quits = true;
+            let mut o = claude_opts(&dir, "t");
+            o.headless = headless;
+            o.resume_session = resume;
+            o.claude_config_dir = Some("/home/me/it's/.jclaude");
+            dispatch(&r, &default_config(), &o).unwrap();
+            let commands = r.commands.borrow();
+            let c = script(&commands[0]);
+            // Before the whole pipeline, because `cat {prompt} | claude` starts with cat.
+            let export = c.find(r"export CLAUDE_CONFIG_DIR='/home/me/it'\''s/.jclaude' && ")
+                .unwrap_or_else(|| panic!("{name}: {c}"));
+            let agent = c.find("claude ").unwrap();
+            let start = c.find("cat ").map_or(agent, |cat| cat.min(agent));
+            assert!(export < start, "{name}: {c}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn a_claude_agent_keeps_the_panes_config_when_the_caller_set_none() {
+        let dir = tdir("hd-orch-config-none");
+        let mut r = fake(&dir, "t", WriteMode::Complete, "ok");
+        r.turn_end = Some(TURN_ENDED.into());
+        r.quits = true;
+        dispatch(&r, &default_config(), &claude_opts(&dir, "t")).unwrap();
+        assert!(!r.commands.borrow()[0].contains("CLAUDE_CONFIG_DIR"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_codex_agent_ignores_the_claude_config_dir() {
+        let dir = tdir("hd-orch-config-codex");
+        let state = dir.join("state");
+        let r = fake(&dir, "t", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "t");
+        o.vendor = Some("codex");
+        o.state_dir = Some(&state);
+        o.claude_config_dir = Some("/cfg");
+        dispatch(&r, &default_config(), &o).unwrap();
+        assert!(!r.commands.borrow()[0].contains("CLAUDE_CONFIG_DIR"));
+        let rec = crate::state::read_record(&state, "t").unwrap().unwrap();
+        assert_eq!(rec.claude_config_dir, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_interactive_claude_starts_under_the_callers_config_dir() {
+        let dir = tdir("hd-orch-config-interactive");
+        let r = fake(&dir, "t", WriteMode::Complete, "ok");
+        let mut o = opts(&dir, "t");
+        o.vendor = Some("claude");
+        o.interactive = true;
+        o.claude_config_dir = Some("/cfg");
+        dispatch(&r, &default_config(), &o).unwrap();
+        let launch = r.commands.borrow()[0].clone();
+        assert!(launch.contains("&& env CLAUDE_CONFIG_DIR='/cfg' claude"), "was: {launch}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_record_keeps_a_claude_agents_config_dir_for_resuming_later() {
+        let dir = tdir("hd-orch-config-record");
+        let state = dir.join("state");
+        let mut r = fake(&dir, "t", WriteMode::Complete, "ok");
+        r.turn_end = Some(TURN_ENDED.into());
+        r.quits = true;
+        let mut o = claude_opts(&dir, "t");
+        o.state_dir = Some(&state);
+        o.claude_config_dir = Some("/cfg");
+        dispatch(&r, &default_config(), &o).unwrap();
+        let rec = crate::state::read_record(&state, "t").unwrap().unwrap();
+        assert_eq!(rec.claude_config_dir.as_deref(), Some("/cfg"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
